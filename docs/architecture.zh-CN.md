@@ -158,6 +158,12 @@ documents:
 sync_operations:
   receipt_id, base_version, operation_json, expected_hash,
   source_ids, status, error, timestamps
+
+document_metadata:
+  doc_id, remote_version, ranges_json, snapshot_metadata_json, metadata_hash
+
+assets:
+  file_id, path, parent_folder_id, remote_hash, size, jj_operation_id
 ```
 
 状态机：
@@ -171,6 +177,11 @@ prepared/inflight/unknown → failed
 
 SQLite 解决“我和哪个远端版本同步过、某次网络写入到底确认没有”；Jujutsu 解决
 “内容是什么、如何回退、如何保留分支和演化历史”。两者互补。
+
+此外，`.jujuleaf/remote-metadata.json` 保存可被 Jujutsu 版本化的远端元数据快照：
+评论 threads、每个文档的 ranges，以及去掉正文后的 history-OT snapshot（其中包含
+tracked changes）。SQLite 是同步判断用的权威 checkpoint；JSON 文件是可审计、可
+回退的历史副本，不会作为普通文件上传回 Overleaf。
 
 ### Profile 与项目绑定
 
@@ -235,9 +246,37 @@ CDP 返回的 Cookie 还会按 base URL 主机过滤；AAI 身份提供方域名
 冲突时工作副本不被覆盖，远端副本保存在
 `.jj/jujuleaf/incoming/<doc-id>`。用户完成合并并 checkpoint 后再同步。
 
+本地全文与远端可见正文比较时会生成字符级 diff，再转换成多个有序、不重叠的
+UTF-16 change。因此两个相距很远的小改动不会把中间正文编码成“删除后重插”，
+评论和修订 range 由 Overleaf 的 OT 只围绕实际变更转换。若直接 push 时发现
+ranges/tracked-change 元数据已经偏离本地 checkpoint，会先拒绝写入；pull 接受
+最新元数据后才可继续。
+
+二进制文件也采用 local/base/remote 三方 hash。远端覆盖前会再次直接下载目标
+文件核对 hash。由于 Overleaf 的上传接口拒绝同名文件，安全覆盖流程为：
+
+```text
+旧文件改成临时备份名 → 上传原名新文件 → 删除旧文件
+                    └─ 上传失败：把旧文件改回原名
+```
+
+pull 发现双方都改了二进制时，把远端版本放到
+`.jj/jujuleaf/incoming-assets/<file-id>`，不覆盖工作副本。
+
 ## 10. undo/redo 与分组
 
 CLI 不按每个键盘事件建历史。一个显式 checkpoint、pull 或 push 边界构成一个
 有意义的版本组。`undo` 会先捕获尚未 checkpoint 的工作副本，再通过 jj-lib
 恢复前一 operation 的 tree；`redo` 恢复 undo 前保存的 operation。整个过程不
 调用外部 `jj` 命令。
+
+## 11. 编译与前台监控
+
+`compile` 调用 Overleaf 的同步编译 HTTP 接口；这个请求在服务端等待 CLSI 返回，
+JujuLeaf 额外设置客户端超时，超时后调用 `/compile/stop`。完成后下载
+`output.log`，识别 `file:line:`、TeX `!` 错误和常见 warning，输出结构化
+diagnostics；完整日志可显示或保存到文件。
+
+`sync --watch` 是前台轮询器：每个周期严格串行执行 pull→push，周期之间等待，
+Ctrl+C 正常退出，遇到任何正文、元数据或二进制冲突立即停止。当前不派生后台
+进程、不安装 systemd 服务；后台 daemon 属于后续阶段。

@@ -52,6 +52,39 @@ pub struct DocumentSyncState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentMetadataState {
+    pub project_id: String,
+    pub doc_id: String,
+    pub remote_version: i64,
+    pub metadata_hash: String,
+    pub ranges_json: String,
+    pub snapshot_metadata_json: String,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssetSyncState {
+    pub project_id: String,
+    pub file_id: String,
+    pub path: String,
+    pub parent_folder_id: String,
+    pub remote_hash: String,
+    pub size: i64,
+    pub jj_operation_id: Option<String>,
+    pub updated_at_ms: i64,
+}
+
+pub struct AssetCheckpoint<'a> {
+    pub project_id: &'a str,
+    pub file_id: &'a str,
+    pub path: &'a str,
+    pub parent_folder_id: &'a str,
+    pub remote_hash: &'a str,
+    pub size: usize,
+    pub jj_operation_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationRecord {
     pub receipt_id: String,
     pub project_id: String,
@@ -78,7 +111,11 @@ fn now_ms() -> i64 {
 }
 
 pub fn content_hash(content: &str) -> String {
-    hex::encode(Sha1::digest(content.as_bytes()))
+    bytes_hash(content.as_bytes())
+}
+
+pub fn bytes_hash(content: &[u8]) -> String {
+    hex::encode(Sha1::digest(content))
 }
 
 impl SyncStore {
@@ -144,8 +181,34 @@ impl SyncStore {
             CREATE INDEX IF NOT EXISTS sync_operations_pending
             ON sync_operations(project_id, doc_id, status, created_at_ms);
 
+            CREATE TABLE IF NOT EXISTS document_metadata (
+                project_id TEXT NOT NULL,
+                doc_id TEXT NOT NULL,
+                remote_version INTEGER NOT NULL CHECK (remote_version >= 0),
+                metadata_hash TEXT NOT NULL,
+                ranges_json TEXT NOT NULL,
+                snapshot_metadata_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (project_id, doc_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS assets (
+                project_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                parent_folder_id TEXT NOT NULL,
+                remote_hash TEXT NOT NULL,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                jj_operation_id TEXT,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (project_id, file_id)
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS assets_by_path
+            ON assets(project_id, path);
+
             INSERT INTO schema_meta(key, value)
-            VALUES ('schema_version', '1')
+            VALUES ('schema_version', '2')
             ON CONFLICT(key) DO UPDATE SET value = excluded.value;
             "#,
         )?;
@@ -238,6 +301,149 @@ impl SyncStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn upsert_document_metadata(
+        &self,
+        project_id: &str,
+        doc_id: &str,
+        remote_version: i64,
+        metadata_hash: &str,
+        ranges_json: &str,
+        snapshot_metadata_json: &str,
+    ) -> Result<()> {
+        ensure!(remote_version >= 0, "remote version cannot be negative");
+        serde_json::from_str::<serde_json::Value>(ranges_json)
+            .context("ranges_json must be valid JSON")?;
+        serde_json::from_str::<serde_json::Value>(snapshot_metadata_json)
+            .context("snapshot_metadata_json must be valid JSON")?;
+        self.connection.execute(
+            r#"
+            INSERT INTO document_metadata(
+                project_id, doc_id, remote_version, metadata_hash,
+                ranges_json, snapshot_metadata_json, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(project_id, doc_id) DO UPDATE SET
+                remote_version = excluded.remote_version,
+                metadata_hash = excluded.metadata_hash,
+                ranges_json = excluded.ranges_json,
+                snapshot_metadata_json = excluded.snapshot_metadata_json,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![
+                project_id,
+                doc_id,
+                remote_version,
+                metadata_hash,
+                ranges_json,
+                snapshot_metadata_json,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn document_metadata(
+        &self,
+        project_id: &str,
+        doc_id: &str,
+    ) -> Result<Option<DocumentMetadataState>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT project_id, doc_id, remote_version, metadata_hash,
+                       ranges_json, snapshot_metadata_json, updated_at_ms
+                FROM document_metadata
+                WHERE project_id = ?1 AND doc_id = ?2
+                "#,
+                params![project_id, doc_id],
+                |row| {
+                    Ok(DocumentMetadataState {
+                        project_id: row.get(0)?,
+                        doc_id: row.get(1)?,
+                        remote_version: row.get(2)?,
+                        metadata_hash: row.get(3)?,
+                        ranges_json: row.get(4)?,
+                        snapshot_metadata_json: row.get(5)?,
+                        updated_at_ms: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_asset(&self, checkpoint: AssetCheckpoint<'_>) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM assets WHERE project_id = ?1 AND path = ?2 AND file_id <> ?3",
+            params![checkpoint.project_id, checkpoint.path, checkpoint.file_id],
+        )?;
+        self.connection.execute(
+            r#"
+            INSERT INTO assets(
+                project_id, file_id, path, parent_folder_id, remote_hash,
+                size, jj_operation_id, updated_at_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            ON CONFLICT(project_id, file_id) DO UPDATE SET
+                path = excluded.path,
+                parent_folder_id = excluded.parent_folder_id,
+                remote_hash = excluded.remote_hash,
+                size = excluded.size,
+                jj_operation_id = excluded.jj_operation_id,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![
+                checkpoint.project_id,
+                checkpoint.file_id,
+                checkpoint.path,
+                checkpoint.parent_folder_id,
+                checkpoint.remote_hash,
+                i64::try_from(checkpoint.size)?,
+                checkpoint.jj_operation_id,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn asset(&self, project_id: &str, file_id: &str) -> Result<Option<AssetSyncState>> {
+        self.connection
+            .query_row(
+                r#"
+                SELECT project_id, file_id, path, parent_folder_id, remote_hash,
+                       size, jj_operation_id, updated_at_ms
+                FROM assets
+                WHERE project_id = ?1 AND file_id = ?2
+                "#,
+                params![project_id, file_id],
+                row_to_asset,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn assets(&self, project_id: &str) -> Result<Vec<AssetSyncState>> {
+        let mut statement = self.connection.prepare(
+            r#"
+            SELECT project_id, file_id, path, parent_folder_id, remote_hash,
+                   size, jj_operation_id, updated_at_ms
+            FROM assets
+            WHERE project_id = ?1
+            ORDER BY path
+            "#,
+        )?;
+        statement
+            .query_map([project_id], row_to_asset)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn remove_asset(&self, project_id: &str, file_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM assets WHERE project_id = ?1 AND file_id = ?2",
+            params![project_id, file_id],
+        )?;
+        Ok(())
     }
 
     pub fn prepare_operation(
@@ -462,6 +668,19 @@ fn row_to_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRecord
     })
 }
 
+fn row_to_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetSyncState> {
+    Ok(AssetSyncState {
+        project_id: row.get(0)?,
+        file_id: row.get(1)?,
+        path: row.get(2)?,
+        parent_folder_id: row.get(3)?,
+        remote_hash: row.get(4)?,
+        size: row.get(5)?,
+        jj_operation_id: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -538,5 +757,46 @@ mod tests {
             .unwrap();
         store.mark_confirmed(&receipt).unwrap();
         assert!(store.mark_inflight(&receipt).is_err());
+    }
+
+    #[test]
+    fn stores_document_metadata_and_replaces_asset_identity_by_path() {
+        let store = SyncStore::open_memory().unwrap();
+        store
+            .upsert_document_metadata("p1", "d1", 2, "m1", "[]", "{}")
+            .unwrap();
+        assert_eq!(
+            store
+                .document_metadata("p1", "d1")
+                .unwrap()
+                .unwrap()
+                .metadata_hash,
+            "m1"
+        );
+
+        store
+            .upsert_asset(AssetCheckpoint {
+                project_id: "p1",
+                file_id: "old",
+                path: "/logo.png",
+                parent_folder_id: "root",
+                remote_hash: "h1",
+                size: 4,
+                jj_operation_id: None,
+            })
+            .unwrap();
+        store
+            .upsert_asset(AssetCheckpoint {
+                project_id: "p1",
+                file_id: "new",
+                path: "/logo.png",
+                parent_folder_id: "root",
+                remote_hash: "h2",
+                size: 5,
+                jj_operation_id: None,
+            })
+            .unwrap();
+        assert!(store.asset("p1", "old").unwrap().is_none());
+        assert_eq!(store.assets("p1").unwrap()[0].file_id, "new");
     }
 }

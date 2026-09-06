@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod cli;
+pub mod compile;
 pub mod jj;
 pub mod operations;
 pub mod project;

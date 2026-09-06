@@ -208,12 +208,43 @@ impl OverleafApi {
     }
 
     pub async fn compile(&mut self, project_id: &str, draft: bool) -> Result<Value> {
+        self.compile_detailed(project_id, draft).await
+    }
+
+    pub async fn compile_detailed(&mut self, project_id: &str, draft: bool) -> Result<Value> {
         self.post_json(
-            &format!("/project/{project_id}/compile"),
+            &format!("/project/{project_id}/compile?file_line_errors=true"),
             json!({"check": "silent", "draft": draft}),
             "compile project",
         )
         .await
+    }
+
+    pub async fn stop_compile(&mut self, project_id: &str) -> Result<Value> {
+        self.post_json(
+            &format!("/project/{project_id}/compile/stop"),
+            json!({}),
+            "stop compile",
+        )
+        .await
+    }
+
+    pub async fn download_compile_output(
+        &mut self,
+        compile_result: &Value,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        let url = compile_result
+            .get("outputFiles")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|file| file.get("path").and_then(Value::as_str) == Some(path))
+            .and_then(|file| file.get("url"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("no {path} in compile output"))?
+            .to_owned();
+        self.download_url(&url, &format!("download {path}")).await
     }
 
     pub async fn download_pdf(&mut self, project_id: &str) -> Result<Vec<u8>> {
@@ -225,23 +256,21 @@ impl OverleafApi {
         if status != "success" {
             bail!("compilation failed: {status}");
         }
-        let url = result
-            .get("outputFiles")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .find(|file| file.get("path").and_then(Value::as_str) == Some("output.pdf"))
-            .and_then(|file| file.get("url"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("no PDF in compile output"))?
-            .to_owned();
-        self.download_url(&url, "download PDF").await
+        self.download_compile_output(&result, "output.pdf").await
     }
 
     pub async fn download_zip(&mut self, project_id: &str) -> Result<Vec<u8>> {
         self.download_url(
             &format!("/project/{project_id}/download/zip"),
             "download project zip",
+        )
+        .await
+    }
+
+    pub async fn download_file(&mut self, project_id: &str, file_id: &str) -> Result<Vec<u8>> {
+        self.download_url(
+            &format!("/project/{project_id}/file/{file_id}"),
+            "download file",
         )
         .await
     }
@@ -298,6 +327,14 @@ impl OverleafApi {
         self.delete_json(
             &format!("/project/{project_id}/doc/{doc_id}"),
             "delete document",
+        )
+        .await
+    }
+
+    pub async fn delete_file(&mut self, project_id: &str, file_id: &str) -> Result<Value> {
+        self.delete_json(
+            &format!("/project/{project_id}/file/{file_id}"),
+            "delete file",
         )
         .await
     }
@@ -376,7 +413,6 @@ impl OverleafApi {
             .mime_str("application/octet-stream")?;
         let form = reqwest::multipart::Form::new()
             .text("relativePath", "null")
-            .text("relativePath", "null")
             .text("name", remote_name.to_owned())
             .text("type", "application/octet-stream")
             .part("qqfile", file);
@@ -391,6 +427,54 @@ impl OverleafApi {
             .await?;
         let response = self.finish_response(response).await?;
         Self::json_response(response, "upload file").await
+    }
+
+    /// Replace a remote binary while keeping a recoverable remote copy until
+    /// the new upload has succeeded. Overleaf rejects duplicate names, so an
+    /// in-place upload is not available through its editor HTTP API.
+    pub async fn replace_file_protected(
+        &mut self,
+        project_id: &str,
+        file_id: &str,
+        folder_id: &str,
+        local_path: &Path,
+        remote_name: &str,
+    ) -> Result<Value> {
+        let backup_name = format!(
+            ".{remote_name}.jujuleaf-backup-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        );
+        self.rename_entity(project_id, "file", file_id, &backup_name)
+            .await
+            .context("failed to create remote binary backup")?;
+
+        match self
+            .upload(project_id, folder_id, local_path, remote_name)
+            .await
+        {
+            Ok(mut uploaded) => {
+                if let Err(error) = self.delete_file(project_id, file_id).await {
+                    bail!(
+                        "new binary was uploaded, but cleanup of remote backup {backup_name} failed: {error:#}"
+                    );
+                }
+                if let Some(object) = uploaded.as_object_mut() {
+                    object.insert("replacedEntityId".into(), json!(file_id));
+                }
+                Ok(uploaded)
+            }
+            Err(upload_error) => {
+                if let Err(rollback_error) = self
+                    .rename_entity(project_id, "file", file_id, remote_name)
+                    .await
+                {
+                    bail!(
+                        "binary upload failed ({upload_error:#}); remote backup rollback also failed ({rollback_error:#}); the old file remains named {backup_name}"
+                    );
+                }
+                Err(upload_error).context("binary upload failed; remote backup was restored")
+            }
+        }
     }
 
     pub async fn diff(

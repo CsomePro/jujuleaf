@@ -12,6 +12,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::api::OverleafApi;
 use crate::auth::{LoginPreset, ProfileStore, Session, SessionStore, interactive_login};
+use crate::compile::{build_compile_report, has_output};
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, TextSelector,
@@ -193,6 +194,13 @@ enum Command {
         /// Document ID shown by `jujuleaf files PROJECT_ID`.
         doc_id: String,
     },
+    /// Permanently delete an uploaded binary file by file ID.
+    DeleteFile {
+        /// Overleaf project ID.
+        project_id: String,
+        /// Uploaded-file ID shown by `jujuleaf files PROJECT_ID`.
+        file_id: String,
+    },
     /// Create a folder in the project root or another folder.
     CreateFolder {
         /// Overleaf project ID.
@@ -257,13 +265,22 @@ enum Command {
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
-    /// Compile a project and show Overleaf compile-result metadata.
+    /// Compile a project, wait for completion, and parse its log diagnostics.
     Compile {
         /// Overleaf project ID.
         project_id: String,
         /// Request Overleaf's faster draft compilation mode.
         #[arg(long)]
         draft: bool,
+        /// Maximum time to wait for Overleaf, in seconds.
+        #[arg(long, default_value_t = 720)]
+        timeout: u64,
+        /// Include the complete output.log text in command output.
+        #[arg(long)]
+        show_log: bool,
+        /// Save the complete output.log to this local path.
+        #[arg(long)]
+        log_output: Option<PathBuf>,
     },
     /// Compile a project and download the resulting PDF.
     Pdf {
@@ -431,13 +448,19 @@ enum Command {
         #[command(flatten)]
         retry: RetryArgs,
     },
-    /// Pull then push when no conflicts are present.
+    /// Pull then push once, or keep synchronizing in the foreground.
     Sync {
         /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
         #[command(flatten)]
         retry: RetryArgs,
+        /// Keep polling local and remote state until Ctrl+C or a conflict.
+        #[arg(long)]
+        watch: bool,
+        /// Delay between foreground sync cycles, in milliseconds.
+        #[arg(long, default_value_t = 2_000)]
+        interval: u64,
     },
     /// Compare local files with the last confirmed remote checkpoint.
     Status {
@@ -1355,6 +1378,10 @@ async fn dispatch_authenticated(
         Command::DeleteDoc { project_id, doc_id } => {
             output(api.delete_doc(&project_id, &doc_id).await?, pretty)
         }
+        Command::DeleteFile {
+            project_id,
+            file_id,
+        } => output(api.delete_file(&project_id, &file_id).await?, pretty),
         Command::CreateFolder {
             project_id,
             name,
@@ -1435,8 +1462,45 @@ async fn dispatch_authenticated(
                 pretty,
             )
         }
-        Command::Compile { project_id, draft } => {
-            output(api.compile(&project_id, draft).await?, pretty)
+        Command::Compile {
+            project_id,
+            draft,
+            timeout,
+            show_log,
+            log_output,
+        } => {
+            ensure!(timeout > 0, "--timeout must be positive");
+            let result = match tokio::time::timeout(
+                Duration::from_secs(timeout),
+                api.compile_detailed(&project_id, draft),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_) => {
+                    tokio::time::timeout(Duration::from_secs(10), api.stop_compile(&project_id))
+                        .await
+                        .ok();
+                    return Err(anyhow!(
+                        "compilation did not finish within {timeout} seconds and was stopped"
+                    ));
+                }
+            };
+            let log = if has_output(&result, "output.log") {
+                let bytes = api.download_compile_output(&result, "output.log").await?;
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            } else {
+                None
+            };
+            if let Some(path) = log_output {
+                let content = log
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("compile result did not include output.log"))?;
+                tokio::fs::write(&path, content)
+                    .await
+                    .with_context(|| format!("failed to write {}", path.display()))?;
+            }
+            output(build_compile_report(result, log, show_log), pretty)
         }
         Command::Pdf {
             project_id,
@@ -1684,18 +1748,58 @@ async fn dispatch_authenticated(
                 pretty,
             )
         }
-        Command::Sync { path, retry } => {
+        Command::Sync {
+            path,
+            retry,
+            watch,
+            interval,
+        } => {
             let root = discover_root(path)?;
-            let pull = pull_project_with_api(&root, &session, api, profile).await?;
-            if !pull.conflicts.is_empty() {
-                return output(json!({"success": false, "pull": pull}), pretty);
+            ensure!(interval > 0, "--interval must be positive");
+            let options = retry.options()?;
+            let mut cycle = 1_u64;
+            loop {
+                let pull = pull_project_with_api(&root, &session, api, profile).await?;
+                if !pull.success {
+                    let value = json!({
+                        "success": false,
+                        "watching": watch,
+                        "cycle": cycle,
+                        "stopped": watch,
+                        "reason": "pull conflict",
+                        "pull": pull
+                    });
+                    return output(value, pretty);
+                }
+                let push = push_project_with_api(&root, &session, api, profile, &options).await?;
+                let success = push.success;
+                let value = json!({
+                    "success": success,
+                    "watching": watch,
+                    "cycle": cycle,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "pull": pull,
+                    "push": push
+                });
+                output(value, pretty)?;
+                if !watch || !success {
+                    return Ok(());
+                }
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => {
+                        result?;
+                        return output(json!({
+                            "success": true,
+                            "watching": false,
+                            "stopped": true,
+                            "reason": "interrupt",
+                            "completedCycles": cycle
+                        }), pretty);
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(interval)) => {}
+                }
+                cycle += 1;
             }
-            let push =
-                push_project_with_api(&root, &session, api, profile, &retry.options()?).await?;
-            output(
-                json!({"success": push.success, "pull": pull, "push": push}),
-                pretty,
-            )
         }
         Command::Login { .. }
         | Command::Profile { .. }
@@ -1839,6 +1943,42 @@ mod tests {
             cli.command,
             Command::Read {
                 content_only: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn compile_and_foreground_sync_options_parse() {
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "compile",
+            "project",
+            "--timeout",
+            "60",
+            "--show-log",
+            "--log-output",
+            "build.log",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Compile {
+                timeout: 60,
+                show_log: true,
+                log_output: Some(_),
+                ..
+            }
+        ));
+
+        let cli =
+            Cli::try_parse_from(["jujuleaf", "sync", "paper", "--watch", "--interval", "750"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Sync {
+                watch: true,
+                interval: 750,
                 ..
             }
         ));

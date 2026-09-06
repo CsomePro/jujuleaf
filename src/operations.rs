@@ -1,6 +1,7 @@
 use anyhow::{Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use similar::{ChangeTag, TextDiff};
 
 pub const LEGACY_OT: &str = "sharejs-text-ot";
 pub const HISTORY_OT: &str = "history-ot";
@@ -72,6 +73,73 @@ pub struct TextMatch {
 
 pub fn utf16_len(text: &str) -> usize {
     text.encode_utf16().count()
+}
+
+/// Build ordered, non-overlapping CodeMirror changes from two complete texts.
+///
+/// The diff runs on Unicode scalar values, then converts every position to the
+/// UTF-16 coordinate system used by CodeMirror and Overleaf. Unchanged spans
+/// between independent edits remain untouched, which is important for remote
+/// comment and tracked-change anchors.
+pub fn minimal_text_changes(before: &str, after: &str) -> Vec<InputChange> {
+    if before == after {
+        return Vec::new();
+    }
+
+    let diff = TextDiff::from_chars(before, after);
+    let mut changes = Vec::new();
+    let mut old_position = 0;
+    let mut pending_from = None;
+    let mut removed = String::new();
+    let mut inserted = String::new();
+
+    let flush = |changes: &mut Vec<InputChange>,
+                 pending_from: &mut Option<usize>,
+                 old_position: usize,
+                 removed: &mut String,
+                 inserted: &mut String| {
+        let Some(from) = pending_from.take() else {
+            return;
+        };
+        changes.push(InputChange {
+            from,
+            to: Some(old_position),
+            insert: Some(std::mem::take(inserted)),
+            expect: Some(std::mem::take(removed)),
+        });
+    };
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                flush(
+                    &mut changes,
+                    &mut pending_from,
+                    old_position,
+                    &mut removed,
+                    &mut inserted,
+                );
+                old_position += utf16_len(change.value());
+            }
+            ChangeTag::Delete => {
+                pending_from.get_or_insert(old_position);
+                removed.push_str(change.value());
+                old_position += utf16_len(change.value());
+            }
+            ChangeTag::Insert => {
+                pending_from.get_or_insert(old_position);
+                inserted.push_str(change.value());
+            }
+        }
+    }
+    flush(
+        &mut changes,
+        &mut pending_from,
+        old_position,
+        &mut removed,
+        &mut inserted,
+    );
+    changes
 }
 
 fn byte_index_at_utf16(text: &str, target: usize) -> Result<usize> {
@@ -788,6 +856,31 @@ mod tests {
         .unwrap();
         assert_eq!(changes[0].from, 7);
         assert_eq!(changes[0].to, 10);
+    }
+
+    #[test]
+    fn complete_text_diff_keeps_independent_edits_separate() {
+        let before = "alpha middle omega";
+        let after = "ALPHA middle OMEGA";
+        let inputs = minimal_text_changes(before, after);
+        assert_eq!(inputs.len(), 2);
+        let normalized = normalize_changes(&inputs, before).unwrap();
+        assert_eq!(apply_changes(before, &normalized).unwrap(), after);
+        assert_eq!(inputs[0].expect.as_deref(), Some("alpha"));
+        assert_eq!(inputs[1].expect.as_deref(), Some("omega"));
+    }
+
+    #[test]
+    fn complete_text_diff_uses_codemirror_utf16_positions() {
+        let before = "😀 old and stay";
+        let after = "😀 new and stay!";
+        let inputs = minimal_text_changes(before, after);
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0].from, 3);
+        assert_eq!(inputs[0].to, Some(6));
+        assert_eq!(inputs[1].from, utf16_len(before));
+        let normalized = normalize_changes(&inputs, before).unwrap();
+        assert_eq!(apply_changes(before, &normalized).unwrap(), after);
     }
 
     #[test]

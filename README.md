@@ -26,6 +26,10 @@ for indented JSON when scripting.
   network outcomes.
 - Conflict-safe pull/push: if both the local file and Overleaf changed from the
   recorded base, JujuLeaf preserves both and refuses to overwrite either side.
+- Character-level local diffs: `push` emits only changed UTF-16 spans instead
+  of replacing the whole document, so unrelated comment/range anchors survive.
+- Versioned remote metadata snapshots plus hash-protected binary synchronization.
+- Compile-log download and file/line diagnostic parsing.
 
 ## Install
 
@@ -199,6 +203,12 @@ The selected profile name and endpoint are recorded in
 bound profile automatically, even if the globally active profile changes. An
 explicit, different `--profile` is rejected before synchronization.
 
+Remote comment threads, document ranges, and history-OT metadata (including
+tracked changes) are captured in `.jujuleaf/remote-metadata.json`. This file is
+part of the Jujutsu working copy, so metadata changes can be inspected and
+restored alongside source changes. Operational baselines and receipts remain
+private under `.jj/jujuleaf/sync.sqlite3`.
+
 Edit files with any editor, then checkpoint and synchronize:
 
 ```sh
@@ -224,6 +234,18 @@ Pull behavior for each document:
 | changed | changed differently | report conflict; save remote copy privately |
 
 Push performs the same check again immediately before sending an OT operation.
+It calculates a character-level diff and emits separate CodeMirror UTF-16
+changes, leaving unchanged spans out of the OT operation. A direct `push`
+refuses a local text write if remote ranges or tracked-change metadata changed
+since the last accepted checkpoint; run `pull`/`sync` first to accept that
+metadata state.
+
+Uploaded binary files use the same local/base/remote hash comparison. Pull can
+add, update, and remove unchanged local binaries. Push uploads new binaries in
+existing remote folders and safely replaces changed binaries by retaining a
+temporary remote backup until the new upload succeeds. Local deletion is not
+published implicitly; use `delete-file` for an intentional remote deletion.
+
 If the connection closes after submission, JujuLeaf reconnects, reads the
 document, and compares its hash to the operation's expected result. Uncertain
 receipts remain in SQLite and are reconciled on the next pull or push.
@@ -235,10 +257,30 @@ jujuleaf undo
 jujuleaf redo
 ```
 
+Keep synchronizing in the foreground while an editor is open:
+
+```sh
+jujuleaf sync --watch
+jujuleaf sync --watch --interval 750
+```
+
+This process polls both local and remote state, performs one pull→push cycle at
+a time, and stops on Ctrl+C or the first conflict. It is not a background
+daemon; background service management is intentionally deferred.
+
+Compile waits for Overleaf's compile response, downloads `output.log`, and
+prints parsed diagnostics:
+
+```sh
+jujuleaf compile PROJECT_ID
+jujuleaf compile PROJECT_ID --show-log
+jujuleaf compile PROJECT_ID --log-output build.log --timeout 720
+```
+
 ## Other commands
 
 Run `jujuleaf --help` for the full list. The Rust CLI includes project
-creation/rename, file and folder management, upload/download, compile/PDF/ZIP,
+creation/rename, file and folder management, upload/download/delete, compile/PDF/ZIP,
 comments and threads, history/diff/search, word count, real-time watch,
 low-level OT validation, and tracked-change acceptance.
 
@@ -249,16 +291,19 @@ Jujutsu model, synchronization state machine, and concurrency design.
 
 ## Current boundaries
 
-- Local-first pull/push treats editable Overleaf documents as first-class sync
-  units. Binary assets are included at clone time and can be managed with the
-  explicit `upload` command, but automatic binary delta synchronization is not
-  implemented yet.
+- New binary files are uploaded automatically only when their parent folder
+  already exists remotely. Creating/renaming/moving folders and documents from
+  arbitrary local filesystem changes still requires the explicit entity
+  commands.
 - A true simultaneous three-way text merge is deliberately not automatic.
   Conflicting remote content is kept under `.jj/jujuleaf/incoming/`; resolve it
   in the working copy, checkpoint, pull again, then push.
 - Overleaf may evict old operations. `joinDoc(fromVersion)` is implemented, but
   callers must fall back to a full snapshot when the server reports missing
   operations.
+- `sync --watch` is a foreground polling loop, not an installed background
+  daemon. Daemon/service support is planned after the recovery semantics above
+  are hardened.
 
 ## License
 
