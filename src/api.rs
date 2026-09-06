@@ -6,7 +6,7 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, LOCA
 use reqwest::{Method, Response, StatusCode};
 use serde_json::{Value, json};
 
-use crate::auth::{Session, SessionStore, merge_cookie};
+use crate::auth::{Session, SessionStore, merge_supported_cookie};
 
 pub struct OverleafApi {
     client: reqwest::Client,
@@ -74,9 +74,7 @@ impl OverleafApi {
         let mut updated = self.cookie.clone();
         for value in response.headers().get_all(SET_COOKIE) {
             let value = value.to_str().unwrap_or_default();
-            if value.starts_with("overleaf_session2=") || value.starts_with("GCLB=") {
-                updated = merge_cookie(&updated, value);
-            }
+            updated = merge_supported_cookie(&updated, value);
         }
         if updated != self.cookie {
             self.cookie = updated;

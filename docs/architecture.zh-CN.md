@@ -199,6 +199,29 @@ Profile 名和 base URL 一起写入：
 旧的单 Session 配置只迁移一次到 `default`；Profile 列表和详情输出不会包含
 Cookie。
 
+### 登录预制与 CSTCloud SSO
+
+`login --preset` 提供三种策略：
+
+- `auto`：识别 `overleaf_session2`、`overleaf.sid`、`sharelatex.sid`，并保留
+  `GCLB`/`latex-session` 路由 Cookie；
+- `overleaf`：预置 `https://www.overleaf.com/login`，要求
+  `overleaf_session2`，保留 `GCLB`；
+- `cstcloud`：预置 `https://latex.cstcloud.cn/oidc/login`，要求
+  `overleaf.sid`，保留 `latex-session`。
+
+CSTCloud 匿名登录页也会设置 `overleaf.sid`，因此 Cookie 出现不代表认证成功。
+浏览器登录必须同时满足：
+
+1. 当前 URL 已回到配置端点的同源 `/project`；
+2. 页面存在非空的 `ol-user_id`；
+3. 页面存在非空的 `ol-csrfToken`；
+4. 目标域 Cookie 中存在预制要求的认证 Cookie。
+
+CDP 返回的 Cookie 还会按 base URL 主机过滤；AAI 身份提供方域名的 Cookie 不会
+进入 Profile。HTTP 响应和 Socket.IO 握手对上述认证/路由 Cookie 的轮换使用同一
+合并规则。
+
 ## 9. pull/push 冲突规则
 
 每个文档记录远端基线 hash。pull 和 push 都会读取实时快照：

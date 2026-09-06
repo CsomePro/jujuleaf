@@ -47,13 +47,31 @@ Interactive login launches an isolated Chrome/Chromium profile and captures only
 the Overleaf session and load-balancer cookies:
 
 ```sh
-jujuleaf login
+jujuleaf login --profile official --preset overleaf
 ```
+
+The default `auto` preset detects `overleaf_session2`, `overleaf.sid`, and
+legacy `sharelatex.sid` session cookies. It retains `GCLB` or `latex-session`
+when the target instance uses one for load-balancer affinity.
+
+CSTCloud SSO has a dedicated preset:
+
+```sh
+jujuleaf login --profile cstcloud --preset cstcloud
+```
+
+It opens `https://latex.cstcloud.cn/oidc/login`, lets the browser complete the
+CSTCloud AAI redirect, and captures `overleaf.sid` plus `latex-session`. An
+anonymous CSTCloud page already has an `overleaf.sid`, so JujuLeaf does not
+treat cookie presence as success: it waits until Chrome returns to the target
+`/project` page and both `ol-user_id` and `ol-csrfToken` are present. Cookies
+from `aai.cstcloud.net` or any other domain are never saved.
 
 You can also provide an existing cookie:
 
 ```sh
 jujuleaf login --cookie 'overleaf_session2=...'
+jujuleaf login --profile cstcloud --preset cstcloud --cookie 'overleaf.sid=...'
 ```
 
 Self-hosted Overleaf is supported:
@@ -62,14 +80,18 @@ Self-hosted Overleaf is supported:
 jujuleaf login --profile company --base-url https://overleaf.example.org
 ```
 
+Available presets are `auto`, `overleaf`, and `cstcloud`. `--instance` is an
+alias for `--preset`; an explicit `--base-url` overrides the preset endpoint.
+
 ## Multiple profiles
 
 A profile combines one Overleaf account cookie with one endpoint. The profile
 option is global and can appear before or after the command:
 
 ```sh
-jujuleaf login --profile official
+jujuleaf login --profile official --preset overleaf
 jujuleaf login --profile company --base-url https://overleaf.example.org
+jujuleaf login --profile cstcloud --preset cstcloud
 jujuleaf profile list
 jujuleaf profile show company
 jujuleaf profile use company

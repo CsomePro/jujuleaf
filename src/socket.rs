@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::auth::merge_cookie;
+use crate::auth::merge_supported_cookie;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -153,9 +153,7 @@ impl OverleafSocket {
         let mut ws_cookie = cookie.to_owned();
         for value in response.headers().get_all(SET_COOKIE) {
             let value = value.to_str().unwrap_or_default();
-            if value.starts_with("GCLB=") {
-                ws_cookie = merge_cookie(&ws_cookie, value);
-            }
+            ws_cookie = merge_supported_cookie(&ws_cookie, value);
         }
         let body = response.text().await?;
         let mut fields = body.split(':');
@@ -180,7 +178,7 @@ impl OverleafSocket {
             public_id: None,
             heartbeat_timeout: Duration::from_secs(heartbeat_seconds.max(1)),
             base_url: base_url.to_owned(),
-            cookie: cookie.to_owned(),
+            cookie: ws_cookie,
             project_id: project_id.to_owned(),
         };
         let connected = timeout(Duration::from_secs(10), async {

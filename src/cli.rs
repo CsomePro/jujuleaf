@@ -9,9 +9,8 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use crate::DEFAULT_BASE_URL;
 use crate::api::OverleafApi;
-use crate::auth::{ProfileStore, Session, SessionStore, interactive_login};
+use crate::auth::{LoginPreset, ProfileStore, Session, SessionStore, interactive_login};
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, TextSelector,
@@ -52,10 +51,20 @@ struct Cli {
 enum Command {
     /// Sign in with Chrome/Chromium or an existing session cookie.
     Login {
+        /// Use an existing Cookie header or a bare session-cookie value.
         #[arg(long)]
         cookie: Option<String>,
-        #[arg(long, default_value = DEFAULT_BASE_URL)]
-        base_url: String,
+        /// Override the endpoint selected by the login preset.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Select the browser entry point and accepted authentication cookies.
+        #[arg(
+            long,
+            alias = "instance",
+            value_enum,
+            default_value_t = LoginPreset::Auto
+        )]
+        preset: LoginPreset,
     },
     /// List, inspect, select, or delete saved profiles.
     Profile {
@@ -806,20 +815,25 @@ pub async fn run() -> Result<()> {
     let pretty = cli.pretty;
     let explicit_profile = cli.profile;
     match cli.command {
-        Command::Login { cookie, base_url } => {
+        Command::Login {
+            cookie,
+            base_url,
+            preset,
+        } => {
             let profiles = ProfileStore::from_default_path()?;
             let profile = profiles.resolve(explicit_profile.as_deref())?;
+            let base_url = base_url.unwrap_or_else(|| preset.default_base_url().to_owned());
             let cookie = match cookie {
                 Some(cookie) => cookie,
                 None => {
                     eprintln!("Opening Chrome for Overleaf sign-in…");
-                    interactive_login(&base_url).await?
+                    interactive_login(&base_url, preset).await?
                 }
             };
-            let session = Session::new(cookie, base_url);
+            let session = Session::new_with_preset(cookie, base_url, preset);
             let mut api = OverleafApi::new(&session, None)?;
             let projects = api.list_projects().await?;
-            let session = Session::new(api.cookie(), api.base_url());
+            let session = Session::new_with_preset(api.cookie(), api.base_url(), preset);
             profiles.session_store(&profile)?.save(&session)?;
             profiles.set_active(&profile)?;
             output(
@@ -827,6 +841,7 @@ pub async fn run() -> Result<()> {
                     "success": true,
                     "profile": profile,
                     "baseUrl": session.base_url,
+                    "preset": preset,
                     "projectCount": projects.get("projects").and_then(Value::as_array).map(Vec::len).unwrap_or(0)
                 }),
                 pretty,
@@ -1383,6 +1398,24 @@ mod tests {
             Command::Profile {
                 command: ProfileCommand::Use { ref name }
             } if name == "company"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "login",
+            "--profile",
+            "cstcloud",
+            "--preset",
+            "cstcloud",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Login {
+                base_url: None,
+                preset: LoginPreset::Cstcloud,
+                ..
+            }
         ));
     }
 
