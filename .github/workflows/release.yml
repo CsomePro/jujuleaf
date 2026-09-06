@@ -1,0 +1,75 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-linux-amd64:
+    name: Release Linux AMD64
+    runs-on: ubuntu-latest
+    env:
+      TARGET: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "jujuleaf") | .version')"
+          expected_tag="v${package_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${package_version}" >&2
+            exit 1
+          fi
+
+      - name: Run quality checks
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --all-targets --all-features -- -D warnings
+          cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${TARGET}"
+
+      - name: Package Linux AMD64 archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_name="jujuleaf-${GITHUB_REF_NAME}-${TARGET}"
+          asset_dir="dist/${asset_name}"
+
+          mkdir -p "${asset_dir}"
+          strip "target/${TARGET}/release/jujuleaf"
+          install -m 0755 "target/${TARGET}/release/jujuleaf" "${asset_dir}/jujuleaf"
+          install -m 0644 README.md LICENSE "${asset_dir}/"
+          "${asset_dir}/jujuleaf" --version
+
+          tar -C dist -czf "dist/${asset_name}.tar.gz" "${asset_name}"
+          cd dist
+          sha256sum "${asset_name}.tar.gz" > SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            --verify-tag \
+            --generate-notes \
+            --title "JujuLeaf ${GITHUB_REF_NAME}"

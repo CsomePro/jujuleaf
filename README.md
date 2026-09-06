@@ -39,6 +39,23 @@ Rust 1.92 or newer is required.
 cargo install --path .
 ```
 
+Tagged releases also provide a prebuilt Linux AMD64 archive on the
+[GitHub Releases page](https://github.com/CsomePro/jujuleaf/releases). Download
+the `x86_64-unknown-linux-gnu` archive and verify it with the accompanying
+`SHA256SUMS` file before placing `jujuleaf` on your `PATH`.
+
+Maintainers publish a release by making the Cargo package version and tag
+match, then pushing the tag:
+
+```sh
+git tag -a v0.1.0 -m 'JujuLeaf v0.1.0'
+git push origin v0.1.0
+```
+
+The tag workflow runs formatting, lint, and tests before it builds the binary
+and creates the GitHub Release. A tag such as `v0.1.0` is rejected unless
+`Cargo.toml` also contains `version = "0.1.0"`.
+
 During development:
 
 ```sh
