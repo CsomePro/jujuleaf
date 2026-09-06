@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{Cursor, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,8 +34,21 @@ use crate::sync::{
     long_about = "JujuLeaf translates editor changes into Overleaf OT events and gives every local project a native Jujutsu history."
 )]
 struct Cli {
-    #[arg(long, global = true, help = "Pretty-print JSON output")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "raw",
+        help = "Output indented JSON"
+    )]
     pretty: bool,
+
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "pretty",
+        help = "Output compact JSON instead of the human-readable view"
+    )]
+    raw: bool,
 
     #[arg(
         long,
@@ -92,8 +106,9 @@ enum Command {
     Read {
         project_id: String,
         path: String,
+        /// Print only the document text, without labels or metadata.
         #[arg(long)]
-        raw: bool,
+        content_only: bool,
         #[arg(long)]
         meta: bool,
     },
@@ -411,11 +426,196 @@ enum EditorCommand {
     ApplyOps,
 }
 
-fn output(value: impl Serialize, pretty: bool) -> Result<()> {
-    if pretty {
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else {
-        println!("{}", serde_json::to_string(&value)?);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Human,
+    RawJson,
+    PrettyJson,
+}
+
+impl OutputMode {
+    fn from_flags(raw: bool, pretty: bool) -> Self {
+        if raw {
+            Self::RawJson
+        } else if pretty {
+            Self::PrettyJson
+        } else {
+            Self::Human
+        }
+    }
+}
+
+fn human_label(key: &str) -> String {
+    let key = key.trim_start_matches('_');
+    let mut label = String::new();
+    let mut previous_was_lowercase = false;
+    for character in key.chars() {
+        if character == '_' || character == '-' {
+            if !label.ends_with(' ') {
+                label.push(' ');
+            }
+            previous_was_lowercase = false;
+        } else {
+            if character.is_uppercase() && previous_was_lowercase {
+                label.push(' ');
+            }
+            label.extend(character.to_uppercase());
+            previous_was_lowercase = character.is_lowercase() || character.is_ascii_digit();
+        }
+    }
+    label
+}
+
+fn human_scalar(value: &Value) -> String {
+    match value {
+        Value::Null => "-".to_owned(),
+        Value::Bool(true) => "yes".to_owned(),
+        Value::Bool(false) => "no".to_owned(),
+        Value::Number(number) => number.to_string(),
+        Value::String(string) => string.clone(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "-".to_owned())
+        }
+    }
+}
+
+fn table_columns(rows: &[Value]) -> Option<Vec<String>> {
+    let mut columns = Vec::new();
+    for row in rows {
+        let object = row.as_object()?;
+        if object.values().any(Value::is_array) || object.values().any(Value::is_object) {
+            return None;
+        }
+        for key in object.keys() {
+            if !columns.contains(key) {
+                columns.push(key.clone());
+            }
+        }
+    }
+    (!columns.is_empty() && columns.len() <= 8).then_some(columns)
+}
+
+fn write_table(output: &mut String, rows: &[Value], indent: usize) {
+    if rows.is_empty() {
+        let _ = writeln!(output, "{}(none)", " ".repeat(indent));
+        return;
+    }
+    let Some(columns) = table_columns(rows) else {
+        for (index, row) in rows.iter().enumerate() {
+            let _ = writeln!(output, "{}[{}]", " ".repeat(indent), index + 1);
+            write_human_value(output, row, indent + 2);
+        }
+        return;
+    };
+    let headers: Vec<_> = columns.iter().map(|column| human_label(column)).collect();
+    let cells: Vec<Vec<_>> = rows
+        .iter()
+        .map(|row| {
+            let object = row.as_object().expect("table rows are objects");
+            columns
+                .iter()
+                .map(|column| object.get(column).map(human_scalar).unwrap_or_default())
+                .collect()
+        })
+        .collect();
+    let widths: Vec<_> = (0..columns.len())
+        .map(|index| {
+            cells
+                .iter()
+                .map(|row| row[index].chars().count())
+                .chain(std::iter::once(headers[index].chars().count()))
+                .max()
+                .unwrap_or_default()
+        })
+        .collect();
+    let write_row = |output: &mut String, row: &[String]| {
+        output.push_str(&" ".repeat(indent));
+        for (index, cell) in row.iter().enumerate() {
+            output.push_str(cell);
+            if index + 1 < row.len() {
+                output
+                    .push_str(&" ".repeat(widths[index].saturating_sub(cell.chars().count()) + 2));
+            }
+        }
+        output.push('\n');
+    };
+    write_row(output, &headers);
+    write_row(
+        output,
+        &widths
+            .iter()
+            .map(|width| "-".repeat(*width))
+            .collect::<Vec<_>>(),
+    );
+    for row in cells {
+        write_row(output, &row);
+    }
+}
+
+fn write_human_value(output: &mut String, value: &Value, indent: usize) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object
+                .iter()
+                .filter(|(_, value)| !value.is_array() && !value.is_object())
+            {
+                let _ = writeln!(
+                    output,
+                    "{}{}: {}",
+                    " ".repeat(indent),
+                    human_label(key),
+                    human_scalar(value)
+                );
+            }
+            for (key, value) in object
+                .iter()
+                .filter(|(_, value)| value.is_array() || value.is_object())
+            {
+                if !output.is_empty() && !output.ends_with("\n\n") {
+                    output.push('\n');
+                }
+                match value {
+                    Value::Array(values) => {
+                        let _ = writeln!(
+                            output,
+                            "{}{} ({})",
+                            " ".repeat(indent),
+                            human_label(key),
+                            values.len()
+                        );
+                        if values.is_empty() {
+                            let _ = writeln!(output, "{}(none)", " ".repeat(indent + 2));
+                        } else {
+                            write_table(output, values, indent + 2);
+                        }
+                    }
+                    Value::Object(_) => {
+                        let _ = writeln!(output, "{}{}", " ".repeat(indent), human_label(key));
+                        write_human_value(output, value, indent + 2);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Value::Array(values) => write_table(output, values, indent),
+        _ => {
+            let _ = writeln!(output, "{}{}", " ".repeat(indent), human_scalar(value));
+        }
+    }
+}
+
+fn render_human(value: &Value) -> String {
+    let mut rendered = String::new();
+    write_human_value(&mut rendered, value, 0);
+    rendered.trim_end().to_owned()
+}
+
+fn output(value: impl Serialize, mode: OutputMode) -> Result<()> {
+    let value = serde_json::to_value(value)?;
+    match mode {
+        OutputMode::Human => println!("{}", render_human(&value)),
+        OutputMode::RawJson => println!("{}", serde_json::to_string(&value)?),
+        OutputMode::PrettyJson => println!("{}", serde_json::to_string_pretty(&value)?),
     }
     Ok(())
 }
@@ -671,7 +871,7 @@ async fn edit_remote(
     command: EditorCommand,
     args: EditorArgs,
     api: &mut OverleafApi,
-    pretty: bool,
+    pretty: OutputMode,
 ) -> Result<()> {
     let (mut socket, project) = connect_project_with_api(api, &args.project_id).await?;
     let document = find_document(&project, &args.path)
@@ -816,7 +1016,7 @@ fn search_zip(zip: &[u8], query: &str) -> Result<Value> {
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let pretty = cli.pretty;
+    let pretty = OutputMode::from_flags(cli.raw, cli.pretty);
     let explicit_profile = cli.profile;
     match cli.command {
         Command::Login {
@@ -914,7 +1114,7 @@ async fn dispatch_authenticated(
     session: Session,
     profile: &str,
     api: &mut OverleafApi,
-    pretty: bool,
+    pretty: OutputMode,
 ) -> Result<()> {
     match command {
         Command::Projects => output(api.list_projects().await?, pretty),
@@ -927,11 +1127,11 @@ async fn dispatch_authenticated(
         Command::Read {
             project_id,
             path,
-            raw,
+            content_only,
             meta,
         } => {
             let value = read_remote_document(api, &project_id, &path).await?;
-            if raw {
+            if content_only {
                 print!("{}", value["content"].as_str().unwrap_or_default());
                 Ok(())
             } else if meta {
@@ -1286,7 +1486,7 @@ async fn dispatch_authenticated(
                         "path": doc_id.and_then(|id| paths.get(id)),
                         "timestamp": chrono::Utc::now().to_rfc3339()
                     }),
-                    false,
+                    pretty,
                 )?;
             }
         }
@@ -1415,6 +1615,48 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn output_defaults_to_human_and_raw_is_machine_json() {
+        let cli = Cli::try_parse_from(["jujuleaf", "projects"]).unwrap();
+        assert_eq!(
+            OutputMode::from_flags(cli.raw, cli.pretty),
+            OutputMode::Human
+        );
+
+        let cli = Cli::try_parse_from(["jujuleaf", "projects", "--raw"]).unwrap();
+        assert_eq!(
+            OutputMode::from_flags(cli.raw, cli.pretty),
+            OutputMode::RawJson
+        );
+        assert!(Cli::try_parse_from(["jujuleaf", "projects", "--raw", "--pretty"]).is_err());
+
+        let cli =
+            Cli::try_parse_from(["jujuleaf", "read", "project", "main.tex", "--content-only"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Read {
+                content_only: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn human_renderer_formats_project_lists_as_tables() {
+        let rendered = render_human(&json!({
+            "projects": [
+                {"_id": "p1", "accessLevel": "owner", "name": "Paper One"},
+                {"_id": "p2", "accessLevel": "readWrite", "name": "Paper Two"}
+            ]
+        }));
+        assert!(rendered.contains("PROJECTS (2)"));
+        assert!(rendered.contains("ID"));
+        assert!(rendered.contains("ACCESS LEVEL"));
+        assert!(rendered.contains("Paper One"));
+        assert!(!rendered.contains('{'));
     }
 
     #[test]

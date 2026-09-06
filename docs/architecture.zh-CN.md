@@ -20,7 +20,7 @@ selection、光标、focus、viewport、scroll、lint、autocomplete、协作者
 ## 2. 分层
 
 ```text
-CLI / JSON
+CLI / 人类可读输出 / JSON
     │
     ├── 精确文本定位、UTF-16 changes、dry-run
     │

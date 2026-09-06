@@ -6,7 +6,8 @@ JujuLeaf is a Rust CLI that translates precise editor changes into Overleaf's
 real-time OT protocol and stores local project versions in a native Jujutsu
 workspace. It is designed for both humans and coding agents: commands are
 predictable, mutations are checked against their expected source text, and
-normal output is JSON.
+normal output is designed for humans. Use `--raw` for compact JSON or `--pretty`
+for indented JSON when scripting.
 
 > JujuLeaf uses private Overleaf web and real-time APIs. Those APIs may change.
 > Keep a project backup while this project is pre-1.0.
@@ -39,6 +40,24 @@ During development:
 ```sh
 cargo run -- --help
 cargo test --all-targets
+```
+
+## Output formats
+
+Commands are human-readable by default. Add `--raw` for compact JSON suitable
+for `jq` and automation, or `--pretty` for indented JSON:
+
+```sh
+jujuleaf projects
+jujuleaf projects --raw | jq '.projects[].name'
+jujuleaf projects --pretty
+```
+
+`read --content-only` prints just the source text, without a table, label, or
+JSON wrapper:
+
+```sh
+jujuleaf read PROJECT_ID main.tex --content-only
 ```
 
 ## Login
@@ -123,7 +142,7 @@ the `default` profile.
 Read and locate text:
 
 ```sh
-jujuleaf read PROJECT_ID main.tex --raw
+jujuleaf read PROJECT_ID main.tex --content-only
 jujuleaf locate PROJECT_ID main.tex --text 'exact source'
 ```
 
