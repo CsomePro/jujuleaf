@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::api::OverleafApi;
 use crate::auth::Session;
 use crate::socket::OverleafSocket;
 
@@ -78,8 +79,23 @@ pub async fn connect_project(
     session: &Session,
     project_id: &str,
 ) -> Result<(OverleafSocket, Value)> {
-    let mut socket =
-        OverleafSocket::connect(&session.base_url, &session.cookie, project_id).await?;
+    let socket = OverleafSocket::connect(&session.base_url, &session.cookie, project_id).await?;
+    join_project_tree(socket, project_id).await
+}
+
+pub async fn connect_project_with_api(
+    api: &mut OverleafApi,
+    project_id: &str,
+) -> Result<(OverleafSocket, Value)> {
+    let socket = OverleafSocket::connect(api.base_url(), api.cookie(), project_id).await?;
+    api.adopt_cookie(socket.cookie())?;
+    join_project_tree(socket, project_id).await
+}
+
+async fn join_project_tree(
+    mut socket: OverleafSocket,
+    project_id: &str,
+) -> Result<(OverleafSocket, Value)> {
     let response = socket.join_project(project_id).await?;
     let info = response
         .first()

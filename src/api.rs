@@ -42,6 +42,16 @@ impl OverleafApi {
         self.csrf.as_deref()
     }
 
+    pub(crate) fn adopt_cookie(&mut self, cookie: &str) -> Result<()> {
+        if self.cookie != cookie {
+            self.cookie = cookie.to_owned();
+            if let Some(store) = &self.session_store {
+                store.update_cookie(&self.cookie)?;
+            }
+        }
+        Ok(())
+    }
+
     fn url(&self, path: &str) -> String {
         if path.starts_with("http://") || path.starts_with("https://") {
             path.to_owned()
@@ -76,12 +86,7 @@ impl OverleafApi {
             let value = value.to_str().unwrap_or_default();
             updated = merge_supported_cookie(&updated, value);
         }
-        if updated != self.cookie {
-            self.cookie = updated;
-            if let Some(store) = &self.session_store {
-                store.update_cookie(&self.cookie)?;
-            }
-        }
+        self.adopt_cookie(&updated)?;
         Ok(response)
     }
 
@@ -508,6 +513,7 @@ impl OverleafApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::LoginPreset;
 
     #[test]
     fn url_supports_overleaf_and_absolute_compile_outputs() {
@@ -518,5 +524,26 @@ mod tests {
             api.url("https://cdn.example.test/output.pdf"),
             "https://cdn.example.test/output.pdf"
         );
+    }
+
+    #[test]
+    fn adopted_socket_cookie_updates_memory_and_the_selected_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = SessionStore::new(temp.path().join("cstcloud.json"));
+        let session = Session::new_with_preset(
+            "overleaf.sid=old; latex-session=route-old",
+            "https://latex.cstcloud.cn",
+            LoginPreset::Cstcloud,
+        );
+        store.save(&session).unwrap();
+        let mut api = OverleafApi::new(&session, Some(store.clone())).unwrap();
+
+        api.adopt_cookie("overleaf.sid=new; latex-session=route-new")
+            .unwrap();
+
+        assert_eq!(api.cookie(), "overleaf.sid=new; latex-session=route-new");
+        let persisted = store.require().unwrap();
+        assert_eq!(persisted.cookie, api.cookie());
+        assert_eq!(persisted.login_preset, LoginPreset::Cstcloud);
     }
 }

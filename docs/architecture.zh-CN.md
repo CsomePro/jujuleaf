@@ -220,7 +220,8 @@ CSTCloud 匿名登录页也会设置 `overleaf.sid`，因此 Cookie 出现不代
 
 CDP 返回的 Cookie 还会按 base URL 主机过滤；AAI 身份提供方域名的 Cookie 不会
 进入 Profile。HTTP 响应和 Socket.IO 握手对上述认证/路由 Cookie 的轮换使用同一
-合并规则。
+合并规则，并立即更新当前 API 客户端和所选 Profile。这样同一命令里的后续请求、
+`sync` 的 pull→push 阶段以及下次启动都会使用最新 Cookie。
 
 ## 9. pull/push 冲突规则
 

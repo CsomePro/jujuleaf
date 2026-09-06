@@ -11,7 +11,7 @@ use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, InputChange, build_document_operations, parse_document_snapshot, utf16_len,
 };
-use crate::project::{collect_documents, connect_project};
+use crate::project::{collect_documents, connect_project_with_api};
 use crate::socket::UpdateOptions;
 use crate::store::{SyncStore, content_hash};
 
@@ -184,7 +184,7 @@ pub async fn clone_project(
     let zip = api.download_zip(project_id).await?;
     extract_zip(&zip, destination)?;
 
-    let (mut socket, project) = connect_project(session, project_id).await?;
+    let (mut socket, project) = connect_project_with_api(api, project_id).await?;
     let documents = collect_documents(&project);
     let mut states = Vec::new();
     for document in &documents {
@@ -232,6 +232,16 @@ pub async fn clone_project(
 }
 
 pub async fn pull_project(root: &Path, session: &Session, profile: &str) -> Result<PullSummary> {
+    let mut api = OverleafApi::new(session, None)?;
+    pull_project_with_api(root, session, &mut api, profile).await
+}
+
+pub async fn pull_project_with_api(
+    root: &Path,
+    session: &Session,
+    api: &mut OverleafApi,
+    profile: &str,
+) -> Result<PullSummary> {
     let binding = ProjectBinding::load(root)?;
     ensure!(
         binding.profile == profile,
@@ -247,7 +257,7 @@ pub async fn pull_project(root: &Path, session: &Session, profile: &str) -> Resu
     let store = database(root)?;
     let mut workspace = JjWorkspace::open(root).await?;
     workspace.checkpoint("local state before pull").await?;
-    let (mut socket, project) = connect_project(session, &binding.project_id).await?;
+    let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
     let documents = collect_documents(&project);
     let mut updated = Vec::new();
     let mut added = Vec::new();
@@ -340,6 +350,17 @@ pub async fn push_project(
     profile: &str,
     options: &UpdateOptions,
 ) -> Result<PushSummary> {
+    let mut api = OverleafApi::new(session, None)?;
+    push_project_with_api(root, session, &mut api, profile, options).await
+}
+
+pub async fn push_project_with_api(
+    root: &Path,
+    session: &Session,
+    api: &mut OverleafApi,
+    profile: &str,
+    options: &UpdateOptions,
+) -> Result<PushSummary> {
     let binding = ProjectBinding::load(root)?;
     ensure!(
         binding.profile == profile,
@@ -355,7 +376,7 @@ pub async fn push_project(
     let store = database(root)?;
     let mut workspace = JjWorkspace::open(root).await?;
     let checkpoint = workspace.checkpoint("local state before push").await?;
-    let (mut socket, project) = connect_project(session, &binding.project_id).await?;
+    let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
     let documents = collect_documents(&project);
     let mut pushed = Vec::new();
     let mut unchanged = Vec::new();

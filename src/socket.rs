@@ -194,6 +194,10 @@ impl OverleafSocket {
         Ok(result)
     }
 
+    pub fn cookie(&self) -> &str {
+        &self.cookie
+    }
+
     async fn read_packet(&mut self) -> Result<Packet> {
         loop {
             let message = self

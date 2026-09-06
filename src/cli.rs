@@ -18,10 +18,11 @@ use crate::operations::{
     parse_document_snapshot, slice_utf16, utf16_len, validate_history_operations,
     visible_to_source_position,
 };
-use crate::project::{collect_documents, connect_project, find_document, root_folder_id};
+use crate::project::{collect_documents, connect_project_with_api, find_document, root_folder_id};
 use crate::socket::UpdateOptions;
 use crate::sync::{
-    ProjectBinding, clone_project, discover_root, local_status, pull_project, push_project,
+    ProjectBinding, clone_project, discover_root, local_status, pull_project_with_api,
+    push_project_with_api,
 };
 
 #[derive(Parser)]
@@ -636,8 +637,12 @@ fn selected_profile(
     profiles.resolve(None)
 }
 
-async fn read_remote_document(session: &Session, project_id: &str, path: &str) -> Result<Value> {
-    let (mut socket, project) = connect_project(session, project_id).await?;
+async fn read_remote_document(
+    api: &mut OverleafApi,
+    project_id: &str,
+    path: &str,
+) -> Result<Value> {
+    let (mut socket, project) = connect_project_with_api(api, project_id).await?;
     let document =
         find_document(&project, path).ok_or_else(|| anyhow!("file not found: {path}"))?;
     let joined = socket.join_doc(&document.id).await?;
@@ -656,8 +661,8 @@ async fn read_remote_document(session: &Session, project_id: &str, path: &str) -
     }))
 }
 
-async fn root_folder(session: &Session, project_id: &str) -> Result<String> {
-    let (socket, project) = connect_project(session, project_id).await?;
+async fn root_folder(api: &mut OverleafApi, project_id: &str) -> Result<String> {
+    let (socket, project) = connect_project_with_api(api, project_id).await?;
     socket.close().await.ok();
     root_folder_id(&project).ok_or_else(|| anyhow!("could not determine root folder ID"))
 }
@@ -665,11 +670,10 @@ async fn root_folder(session: &Session, project_id: &str) -> Result<String> {
 async fn edit_remote(
     command: EditorCommand,
     args: EditorArgs,
-    session: &Session,
     api: &mut OverleafApi,
     pretty: bool,
 ) -> Result<()> {
-    let (mut socket, project) = connect_project(session, &args.project_id).await?;
+    let (mut socket, project) = connect_project_with_api(api, &args.project_id).await?;
     let document = find_document(&project, &args.path)
         .ok_or_else(|| anyhow!("file not found: {}", args.path))?;
     let joined = socket.join_doc(&document.id).await?;
@@ -926,7 +930,7 @@ async fn dispatch_authenticated(
             raw,
             meta,
         } => {
-            let value = read_remote_document(&session, &project_id, &path).await?;
+            let value = read_remote_document(api, &project_id, &path).await?;
             if raw {
                 print!("{}", value["content"].as_str().unwrap_or_default());
                 Ok(())
@@ -941,32 +945,22 @@ async fn dispatch_authenticated(
             path,
             text,
         } => {
-            let value = read_remote_document(&session, &project_id, &path).await?;
+            let value = read_remote_document(api, &project_id, &path).await?;
             let matches = locate_text(value["content"].as_str().unwrap_or_default(), &text)?;
             output(
                 json!({"path": path, "text": text, "matchCount": matches.len(), "matches": matches}),
                 pretty,
             )
         }
-        Command::Edit(args) => edit_remote(EditorCommand::Edit, args, &session, api, pretty).await,
-        Command::Suggest(args) => {
-            edit_remote(EditorCommand::Suggest, args, &session, api, pretty).await
-        }
-        Command::Insert(args) => {
-            edit_remote(EditorCommand::Insert, args, &session, api, pretty).await
-        }
-        Command::Delete(args) => {
-            edit_remote(EditorCommand::Delete, args, &session, api, pretty).await
-        }
-        Command::Replace(args) => {
-            edit_remote(EditorCommand::Replace, args, &session, api, pretty).await
-        }
+        Command::Edit(args) => edit_remote(EditorCommand::Edit, args, api, pretty).await,
+        Command::Suggest(args) => edit_remote(EditorCommand::Suggest, args, api, pretty).await,
+        Command::Insert(args) => edit_remote(EditorCommand::Insert, args, api, pretty).await,
+        Command::Delete(args) => edit_remote(EditorCommand::Delete, args, api, pretty).await,
+        Command::Replace(args) => edit_remote(EditorCommand::Replace, args, api, pretty).await,
         Command::ApplyChanges(args) => {
-            edit_remote(EditorCommand::ApplyChanges, args, &session, api, pretty).await
+            edit_remote(EditorCommand::ApplyChanges, args, api, pretty).await
         }
-        Command::ApplyOps(args) => {
-            edit_remote(EditorCommand::ApplyOps, args, &session, api, pretty).await
-        }
+        Command::ApplyOps(args) => edit_remote(EditorCommand::ApplyOps, args, api, pretty).await,
         Command::AcceptChanges {
             project_id,
             doc_id,
@@ -983,7 +977,7 @@ async fn dispatch_authenticated(
         } => {
             let parent = match parent {
                 Some(parent) => parent,
-                None => root_folder(&session, &project_id).await?,
+                None => root_folder(api, &project_id).await?,
             };
             output(
                 api.create_doc(&project_id, &name, Some(&parent)).await?,
@@ -1000,7 +994,7 @@ async fn dispatch_authenticated(
         } => {
             let parent = match parent {
                 Some(parent) => parent,
-                None => root_folder(&session, &project_id).await?,
+                None => root_folder(api, &project_id).await?,
             };
             output(
                 api.create_folder(&project_id, &name, Some(&parent)).await?,
@@ -1039,7 +1033,7 @@ async fn dispatch_authenticated(
         } => {
             let parent = match parent {
                 Some(parent) => parent,
-                None => root_folder(&session, &project_id).await?,
+                None => root_folder(api, &project_id).await?,
             };
             let name = name
                 .or_else(|| {
@@ -1059,7 +1053,7 @@ async fn dispatch_authenticated(
             path,
             output: output_path,
         } => {
-            let value = read_remote_document(&session, &project_id, &path).await?;
+            let value = read_remote_document(api, &project_id, &path).await?;
             let output_path = output_path.unwrap_or_else(|| {
                 Path::new(&path)
                     .file_name()
@@ -1117,7 +1111,7 @@ async fn dispatch_authenticated(
             length,
             occurrence,
         } => {
-            let (mut socket, project) = connect_project(&session, &project_id).await?;
+            let (mut socket, project) = connect_project_with_api(api, &project_id).await?;
             let document =
                 find_document(&project, &path).ok_or_else(|| anyhow!("file not found: {path}"))?;
             let joined = socket.join_doc(&document.id).await?;
@@ -1258,7 +1252,7 @@ async fn dispatch_authenticated(
             output(search_zip(&zip, &query)?, pretty)
         }
         Command::Watch { project_id } => {
-            let (mut socket, project) = connect_project(&session, &project_id).await?;
+            let (mut socket, project) = connect_project_with_api(api, &project_id).await?;
             let documents = collect_documents(&project);
             let paths: HashMap<_, _> = documents
                 .iter()
@@ -1310,22 +1304,26 @@ async fn dispatch_authenticated(
         ),
         Command::Pull { path } => {
             let root = discover_root(path)?;
-            output(pull_project(&root, &session, profile).await?, pretty)
+            output(
+                pull_project_with_api(&root, &session, api, profile).await?,
+                pretty,
+            )
         }
         Command::Push { path, retry } => {
             let root = discover_root(path)?;
             output(
-                push_project(&root, &session, profile, &retry.options()?).await?,
+                push_project_with_api(&root, &session, api, profile, &retry.options()?).await?,
                 pretty,
             )
         }
         Command::Sync { path, retry } => {
             let root = discover_root(path)?;
-            let pull = pull_project(&root, &session, profile).await?;
+            let pull = pull_project_with_api(&root, &session, api, profile).await?;
             if !pull.conflicts.is_empty() {
                 return output(json!({"success": false, "pull": pull}), pretty);
             }
-            let push = push_project(&root, &session, profile, &retry.options()?).await?;
+            let push =
+                push_project_with_api(&root, &session, api, profile, &retry.options()?).await?;
             output(
                 json!({"success": push.success, "pull": pull, "push": push}),
                 pretty,
