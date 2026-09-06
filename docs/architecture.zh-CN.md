@@ -172,6 +172,33 @@ prepared/inflight/unknown → failed
 SQLite 解决“我和哪个远端版本同步过、某次网络写入到底确认没有”；Jujutsu 解决
 “内容是什么、如何回退、如何保留分支和演化历史”。两者互补。
 
+### Profile 与项目绑定
+
+一个 Profile 绑定一个 Overleaf 端点和一份账号 Cookie：
+
+```text
+~/.config/jujuleaf/
+├── active-profile
+└── profiles/
+    ├── default.json
+    ├── official.json
+    └── company.json
+```
+
+直接远程命令按“显式 `--profile` → 当前 active profile”选择身份。clone 时会把
+Profile 名和 base URL 一起写入：
+
+```text
+<project>/.jj/jujuleaf/project.json
+```
+
+项目中的 pull/push/sync 按“显式 `--profile` → 项目绑定 Profile”选择身份，并且
+同时核对 Profile 名和 base URL。因此即使两个账号使用同一个 Overleaf 域名，也
+不会仅凭 URL 相同就把内容推给错误账号。
+
+旧的单 Session 配置只迁移一次到 `default`；Profile 列表和详情输出不会包含
+Cookie。
+
 ## 9. pull/push 冲突规则
 
 每个文档记录远端基线 hash。pull 和 push 都会读取实时快照：

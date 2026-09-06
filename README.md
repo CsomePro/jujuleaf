@@ -59,12 +59,42 @@ jujuleaf login --cookie 'overleaf_session2=...'
 Self-hosted Overleaf is supported:
 
 ```sh
-jujuleaf login --base-url https://overleaf.example.org
+jujuleaf login --profile company --base-url https://overleaf.example.org
 ```
 
-The session is stored with mode `0600` under the platform configuration
-directory. If present, the old `overleaf-cli` session is read as a migration
-fallback.
+## Multiple profiles
+
+A profile combines one Overleaf account cookie with one endpoint. The profile
+option is global and can appear before or after the command:
+
+```sh
+jujuleaf login --profile official
+jujuleaf login --profile company --base-url https://overleaf.example.org
+jujuleaf profile list
+jujuleaf profile show company
+jujuleaf profile use company
+jujuleaf --profile official projects
+jujuleaf profile delete company
+```
+
+Login creates or replaces the selected profile and makes it active. `profile
+list` and `profile show` never print cookies. Outside a local clone, remote
+commands use an explicit `--profile` or fall back to the active profile.
+
+Profiles are stored under the platform configuration directory:
+
+```text
+~/.config/jujuleaf/
+├── active-profile
+└── profiles/
+    ├── default.json
+    ├── official.json
+    └── company.json
+```
+
+Directories use mode `0700` and files use mode `0600` on Unix. An existing
+JujuLeaf `session.json`, or an old `overleaf-cli` session, is migrated once to
+the `default` profile.
 
 ## Precise remote editing
 
@@ -118,10 +148,15 @@ jujuleaf suggest PROJECT_ID main.tex \
 Clone creates normal project files plus a hidden `.jj` repository:
 
 ```sh
-jujuleaf clone PROJECT_ID paper
+jujuleaf --profile company clone PROJECT_ID paper
 cd paper
 jujuleaf status
 ```
+
+The selected profile name and endpoint are recorded in
+`.jj/jujuleaf/project.json`. Later `pull`, `push`, and `sync` commands use that
+bound profile automatically, even if the globally active profile changes. An
+explicit, different `--profile` is rejected before synchronization.
 
 Edit files with any editor, then checkpoint and synchronize:
 

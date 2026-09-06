@@ -11,7 +11,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::DEFAULT_BASE_URL;
 use crate::api::OverleafApi;
-use crate::auth::{Session, SessionStore, interactive_login};
+use crate::auth::{ProfileStore, Session, SessionStore, interactive_login};
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, TextSelector,
@@ -21,7 +21,9 @@ use crate::operations::{
 };
 use crate::project::{collect_documents, connect_project, find_document, root_folder_id};
 use crate::socket::UpdateOptions;
-use crate::sync::{clone_project, discover_root, local_status, pull_project, push_project};
+use crate::sync::{
+    ProjectBinding, clone_project, discover_root, local_status, pull_project, push_project,
+};
 
 #[derive(Parser)]
 #[command(
@@ -33,6 +35,14 @@ use crate::sync::{clone_project, discover_root, local_status, pull_project, push
 struct Cli {
     #[arg(long, global = true, help = "Pretty-print JSON output")]
     pretty: bool,
+
+    #[arg(
+        long,
+        global = true,
+        value_name = "NAME",
+        help = "Use a named Overleaf account/endpoint profile"
+    )]
+    profile: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -46,6 +56,11 @@ enum Command {
         cookie: Option<String>,
         #[arg(long, default_value = DEFAULT_BASE_URL)]
         base_url: String,
+    },
+    /// List, inspect, select, or delete saved profiles.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
     },
     /// List Overleaf projects.
     #[command(visible_alias = "ls-projects")]
@@ -288,6 +303,19 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// List profiles without exposing cookies.
+    List,
+    /// Set the active profile used outside a bound local clone.
+    Use { name: String },
+    /// Show profile metadata without exposing its cookie.
+    #[command(visible_alias = "current")]
+    Show { name: Option<String> },
+    /// Delete a saved profile. Local clones and remote sessions are untouched.
+    Delete { name: String },
 }
 
 #[derive(Args, Debug, Clone)]
@@ -566,11 +594,37 @@ async fn requested_changes(
     }
 }
 
-async fn authenticated() -> Result<(SessionStore, Session, OverleafApi)> {
-    let store = SessionStore::from_default_path()?;
-    let session = store.require()?;
+async fn authenticated(
+    profiles: &ProfileStore,
+    profile: &str,
+) -> Result<(SessionStore, Session, OverleafApi)> {
+    let store = profiles.session_store(profile)?;
+    let session = store.require().with_context(|| {
+        format!("profile '{profile}' is not authenticated; run: jujuleaf login --profile {profile}")
+    })?;
     let api = OverleafApi::new(&session, Some(store.clone()))?;
     Ok((store, session, api))
+}
+
+fn selected_profile(
+    profiles: &ProfileStore,
+    explicit: Option<&str>,
+    command: &Command,
+) -> Result<String> {
+    if let Some(explicit) = explicit {
+        return profiles.resolve(Some(explicit));
+    }
+    let path = match command {
+        Command::Pull { path } | Command::Push { path, .. } | Command::Sync { path, .. } => {
+            Some(path)
+        }
+        _ => None,
+    };
+    if let Some(path) = path {
+        let root = discover_root(path)?;
+        return Ok(ProjectBinding::load(&root)?.profile);
+    }
+    profiles.resolve(None)
 }
 
 async fn read_remote_document(session: &Session, project_id: &str, path: &str) -> Result<Value> {
@@ -750,8 +804,11 @@ fn search_zip(zip: &[u8], query: &str) -> Result<Value> {
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let pretty = cli.pretty;
+    let explicit_profile = cli.profile;
     match cli.command {
         Command::Login { cookie, base_url } => {
+            let profiles = ProfileStore::from_default_path()?;
+            let profile = profiles.resolve(explicit_profile.as_deref())?;
             let cookie = match cookie {
                 Some(cookie) => cookie,
                 None => {
@@ -759,18 +816,51 @@ pub async fn run() -> Result<()> {
                     interactive_login(&base_url).await?
                 }
             };
-            let store = SessionStore::from_default_path()?;
             let session = Session::new(cookie, base_url);
-            store.save(&session)?;
-            let mut api = OverleafApi::new(&session, Some(store))?;
+            let mut api = OverleafApi::new(&session, None)?;
             let projects = api.list_projects().await?;
+            let session = Session::new(api.cookie(), api.base_url());
+            profiles.session_store(&profile)?.save(&session)?;
+            profiles.set_active(&profile)?;
             output(
                 json!({
                     "success": true,
+                    "profile": profile,
+                    "baseUrl": session.base_url,
                     "projectCount": projects.get("projects").and_then(Value::as_array).map(Vec::len).unwrap_or(0)
                 }),
                 pretty,
             )
+        }
+        Command::Profile { command } => {
+            let profiles = ProfileStore::from_default_path()?;
+            match command {
+                ProfileCommand::List => output(
+                    json!({
+                        "active": profiles.active_name()?,
+                        "profiles": profiles.list()?
+                    }),
+                    pretty,
+                ),
+                ProfileCommand::Use { name } => {
+                    profiles.set_active(&name)?;
+                    output(
+                        json!({"success": true, "active": name, "profile": profiles.get(&name)?}),
+                        pretty,
+                    )
+                }
+                ProfileCommand::Show { name } => {
+                    let name = profiles.resolve(name.as_deref().or(explicit_profile.as_deref()))?;
+                    output(profiles.get(&name)?, pretty)
+                }
+                ProfileCommand::Delete { name } => {
+                    profiles.delete(&name)?;
+                    output(
+                        json!({"success": true, "deleted": name, "active": profiles.active_name()?}),
+                        pretty,
+                    )
+                }
+            }
         }
         Command::Status { path } => {
             let root = discover_root(path)?;
@@ -792,8 +882,10 @@ pub async fn run() -> Result<()> {
             output(workspace.redo().await?, pretty)
         }
         command => {
-            let (_store, session, mut api) = authenticated().await?;
-            dispatch_authenticated(command, session, &mut api, pretty).await
+            let profiles = ProfileStore::from_default_path()?;
+            let profile = selected_profile(&profiles, explicit_profile.as_deref(), &command)?;
+            let (_store, session, mut api) = authenticated(&profiles, &profile).await?;
+            dispatch_authenticated(command, session, &profile, &mut api, pretty).await
         }
     }
 }
@@ -801,6 +893,7 @@ pub async fn run() -> Result<()> {
 async fn dispatch_authenticated(
     command: Command,
     session: Session,
+    profile: &str,
     api: &mut OverleafApi,
     pretty: bool,
 ) -> Result<()> {
@@ -1197,33 +1290,34 @@ async fn dispatch_authenticated(
             project_id,
             destination,
         } => output(
-            clone_project(api, &session, &project_id, &destination).await?,
+            clone_project(api, &session, profile, &project_id, &destination).await?,
             pretty,
         ),
         Command::Pull { path } => {
             let root = discover_root(path)?;
-            output(pull_project(&root, &session).await?, pretty)
+            output(pull_project(&root, &session, profile).await?, pretty)
         }
         Command::Push { path, retry } => {
             let root = discover_root(path)?;
             output(
-                push_project(&root, &session, &retry.options()?).await?,
+                push_project(&root, &session, profile, &retry.options()?).await?,
                 pretty,
             )
         }
         Command::Sync { path, retry } => {
             let root = discover_root(path)?;
-            let pull = pull_project(&root, &session).await?;
+            let pull = pull_project(&root, &session, profile).await?;
             if !pull.conflicts.is_empty() {
                 return output(json!({"success": false, "pull": pull}), pretty);
             }
-            let push = push_project(&root, &session, &retry.options()?).await?;
+            let push = push_project(&root, &session, profile, &retry.options()?).await?;
             output(
                 json!({"success": push.success, "pull": pull, "push": push}),
                 pretty,
             )
         }
         Command::Login { .. }
+        | Command::Profile { .. }
         | Command::Status { .. }
         | Command::Checkpoint { .. }
         | Command::Undo { .. }
@@ -1265,5 +1359,56 @@ mod tests {
         };
         assert_eq!(args.old.as_deref(), Some("cat"));
         assert_eq!(args.occurrence, Some(2));
+    }
+
+    #[test]
+    fn profile_is_global_and_management_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "login",
+            "--profile",
+            "company",
+            "--base-url",
+            "https://latex.company.test",
+            "--cookie",
+            "secret",
+        ])
+        .unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("company"));
+        assert!(matches!(cli.command, Command::Login { .. }));
+
+        let cli = Cli::try_parse_from(["jujuleaf", "profile", "use", "company"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Profile {
+                command: ProfileCommand::Use { ref name }
+            } if name == "company"
+        ));
+    }
+
+    #[test]
+    fn local_sync_uses_the_bound_profile_unless_explicitly_overridden() {
+        let project = tempfile::tempdir().unwrap();
+        ProjectBinding {
+            project_id: "p1".into(),
+            base_url: "https://latex.company.test".into(),
+            profile: "company".into(),
+        }
+        .save(project.path())
+        .unwrap();
+        let config = tempfile::tempdir().unwrap();
+        let profiles = ProfileStore::new(config.path()).unwrap();
+        let command = Command::Pull {
+            path: project.path().to_owned(),
+        };
+
+        assert_eq!(
+            selected_profile(&profiles, None, &command).unwrap(),
+            "company"
+        );
+        assert_eq!(
+            selected_profile(&profiles, Some("official"), &command).unwrap(),
+            "official"
+        );
     }
 }

@@ -6,7 +6,7 @@ use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::api::OverleafApi;
-use crate::auth::Session;
+use crate::auth::{DEFAULT_PROFILE, Session};
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, InputChange, build_document_operations, parse_document_snapshot, utf16_len,
@@ -22,6 +22,12 @@ const STATE_DIR: &str = ".jj/jujuleaf";
 pub struct ProjectBinding {
     pub project_id: String,
     pub base_url: String,
+    #[serde(default = "default_profile")]
+    pub profile: String,
+}
+
+fn default_profile() -> String {
+    DEFAULT_PROFILE.to_owned()
 }
 
 impl ProjectBinding {
@@ -51,6 +57,7 @@ impl ProjectBinding {
 pub struct CloneSummary {
     pub success: bool,
     pub project_id: String,
+    pub profile: String,
     pub path: String,
     pub document_count: usize,
     pub jj_operation_id: String,
@@ -61,6 +68,7 @@ pub struct CloneSummary {
 pub struct PullSummary {
     pub success: bool,
     pub project_id: String,
+    pub profile: String,
     pub updated: Vec<String>,
     pub added: Vec<String>,
     pub local_only: Vec<String>,
@@ -74,6 +82,7 @@ pub struct PullSummary {
 pub struct PushSummary {
     pub success: bool,
     pub project_id: String,
+    pub profile: String,
     pub pushed: Vec<String>,
     pub unchanged: Vec<String>,
     pub conflicts: Vec<String>,
@@ -85,6 +94,7 @@ pub struct PushSummary {
 #[serde(rename_all = "camelCase")]
 pub struct StatusSummary {
     pub project_id: String,
+    pub profile: String,
     pub modified: Vec<String>,
     pub missing: Vec<String>,
     pub clean: Vec<String>,
@@ -157,6 +167,7 @@ fn extract_zip(bytes: &[u8], destination: &Path) -> Result<()> {
 pub async fn clone_project(
     api: &mut OverleafApi,
     session: &Session,
+    profile: &str,
     project_id: &str,
     destination: &Path,
 ) -> Result<CloneSummary> {
@@ -192,6 +203,7 @@ pub async fn clone_project(
     let binding = ProjectBinding {
         project_id: project_id.to_owned(),
         base_url: session.base_url.clone(),
+        profile: profile.to_owned(),
     };
     let mut workspace = JjWorkspace::init(destination).await?;
     binding.save(destination)?;
@@ -212,14 +224,20 @@ pub async fn clone_project(
     Ok(CloneSummary {
         success: true,
         project_id: project_id.to_owned(),
+        profile: profile.to_owned(),
         path: destination.display().to_string(),
         document_count: documents.len(),
         jj_operation_id: checkpoint.operation_id,
     })
 }
 
-pub async fn pull_project(root: &Path, session: &Session) -> Result<PullSummary> {
+pub async fn pull_project(root: &Path, session: &Session, profile: &str) -> Result<PullSummary> {
     let binding = ProjectBinding::load(root)?;
+    ensure!(
+        binding.profile == profile,
+        "clone is bound to profile '{}', but selected profile is '{profile}'",
+        binding.profile
+    );
     ensure!(
         binding.base_url == session.base_url,
         "clone belongs to {}, but current session uses {}",
@@ -306,6 +324,7 @@ pub async fn pull_project(root: &Path, session: &Session) -> Result<PullSummary>
     Ok(PullSummary {
         success: conflicts.is_empty(),
         project_id: binding.project_id,
+        profile: binding.profile,
         updated,
         added,
         local_only,
@@ -318,9 +337,15 @@ pub async fn pull_project(root: &Path, session: &Session) -> Result<PullSummary>
 pub async fn push_project(
     root: &Path,
     session: &Session,
+    profile: &str,
     options: &UpdateOptions,
 ) -> Result<PushSummary> {
     let binding = ProjectBinding::load(root)?;
+    ensure!(
+        binding.profile == profile,
+        "clone is bound to profile '{}', but selected profile is '{profile}'",
+        binding.profile
+    );
     ensure!(
         binding.base_url == session.base_url,
         "clone belongs to {}, but current session uses {}",
@@ -440,6 +465,7 @@ pub async fn push_project(
     Ok(PushSummary {
         success: conflicts.is_empty() && unknown.is_empty(),
         project_id: binding.project_id,
+        profile: binding.profile,
         pushed,
         unchanged,
         conflicts,
@@ -468,6 +494,7 @@ pub async fn local_status(root: &Path) -> Result<StatusSummary> {
     }
     Ok(StatusSummary {
         project_id: binding.project_id,
+        profile: binding.profile,
         modified,
         missing,
         clean,
@@ -504,11 +531,19 @@ mod tests {
         ProjectBinding {
             project_id: "p1".into(),
             base_url: "https://example.test".into(),
+            profile: DEFAULT_PROFILE.into(),
         }
         .save(temp.path())
         .unwrap();
         let nested = temp.path().join("chapters");
         std::fs::create_dir(&nested).unwrap();
         assert_eq!(discover_root(&nested).unwrap(), temp.path());
+    }
+
+    #[test]
+    fn old_project_bindings_default_to_the_default_profile() {
+        let binding: ProjectBinding =
+            serde_json::from_str(r#"{"projectId":"p1","baseUrl":"https://example.test"}"#).unwrap();
+        assert_eq!(binding.profile, DEFAULT_PROFILE);
     }
 }

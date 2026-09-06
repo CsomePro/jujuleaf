@@ -1,8 +1,9 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use directories::ProjectDirs;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use tokio::time::{Instant, sleep};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::DEFAULT_BASE_URL;
+
+pub const DEFAULT_PROFILE: &str = "default";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,18 +61,8 @@ pub struct SessionStore {
 }
 
 impl SessionStore {
-    pub fn default_path() -> Result<PathBuf> {
-        let dirs = ProjectDirs::from("", "", "jujuleaf")
-            .ok_or_else(|| anyhow!("could not determine the user configuration directory"))?;
-        Ok(dirs.config_dir().join("session.json"))
-    }
-
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self { path: path.into() }
-    }
-
-    pub fn from_default_path() -> Result<Self> {
-        Ok(Self::new(Self::default_path()?))
     }
 
     pub fn path(&self) -> &Path {
@@ -78,29 +71,14 @@ impl SessionStore {
 
     pub fn load(&self) -> Result<Option<Session>> {
         if !self.path.exists() {
-            return self.load_legacy_session();
+            return Ok(None);
         }
         let bytes = std::fs::read(&self.path)
             .with_context(|| format!("failed to read {}", self.path.display()))?;
-        let session = serde_json::from_slice(&bytes)
+        let mut session: Session = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid session file {}", self.path.display()))?;
+        session.base_url = session.base_url.trim_end_matches('/').to_owned();
         Ok(Some(session))
-    }
-
-    fn load_legacy_session(&self) -> Result<Option<Session>> {
-        let Some(config_root) = self.path.parent().and_then(Path::parent) else {
-            return Ok(None);
-        };
-        let legacy_path = config_root.join("overleaf-cli").join("session.json");
-        if !legacy_path.exists() {
-            return Ok(None);
-        }
-        let value: Value = serde_json::from_slice(&std::fs::read(&legacy_path)?)
-            .context("invalid legacy overleaf-cli session")?;
-        let Some(cookie) = value.get("cookie").and_then(Value::as_str) else {
-            return Ok(None);
-        };
-        Ok(Some(Session::new(cookie, DEFAULT_BASE_URL)))
     }
 
     pub fn require(&self) -> Result<Session> {
@@ -141,6 +119,232 @@ impl SessionStore {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSummary {
+    pub name: String,
+    pub base_url: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileStore {
+    root: PathBuf,
+}
+
+impl ProfileStore {
+    pub fn default_root() -> Result<PathBuf> {
+        let dirs = ProjectDirs::from("", "", "jujuleaf")
+            .ok_or_else(|| anyhow!("could not determine the user configuration directory"))?;
+        Ok(dirs.config_dir().to_owned())
+    }
+
+    pub fn from_default_path() -> Result<Self> {
+        Self::new(Self::default_root()?)
+    }
+
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
+        let store = Self { root: root.into() };
+        store.ensure_migrated()?;
+        Ok(store)
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn profiles_dir(&self) -> PathBuf {
+        self.root.join("profiles")
+    }
+
+    fn active_path(&self) -> PathBuf {
+        self.root.join("active-profile")
+    }
+
+    fn migration_marker(&self) -> PathBuf {
+        self.root.join(".profiles-v1-migrated")
+    }
+
+    fn create_private_dir(path: &Path) -> Result<()> {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Ok(())
+    }
+
+    fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow!("configuration path has no parent"))?;
+        Self::create_private_dir(parent)?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("failed to write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    }
+
+    fn ensure_migrated(&self) -> Result<()> {
+        Self::create_private_dir(&self.root)?;
+        Self::create_private_dir(&self.profiles_dir())?;
+        let marker = self.migration_marker();
+        if marker.exists() {
+            return Ok(());
+        }
+
+        let default_store = self.session_store_unchecked(DEFAULT_PROFILE);
+        if !default_store.path().exists() {
+            let mut candidates = vec![self.root.join("session.json")];
+            if let Some(config_root) = self.root.parent() {
+                candidates.push(config_root.join("overleaf-cli").join("session.json"));
+            }
+            for candidate in candidates {
+                if let Some(session) = SessionStore::new(candidate).load()? {
+                    default_store.save(&session)?;
+                    break;
+                }
+            }
+        }
+        Self::write_private(&marker, b"1\n")
+    }
+
+    fn session_store_unchecked(&self, name: &str) -> SessionStore {
+        SessionStore::new(self.profiles_dir().join(format!("{name}.json")))
+    }
+
+    pub fn session_store(&self, name: &str) -> Result<SessionStore> {
+        validate_profile_name(name)?;
+        Ok(self.session_store_unchecked(name))
+    }
+
+    pub fn active_name(&self) -> Result<String> {
+        let path = self.active_path();
+        if !path.exists() {
+            return Ok(DEFAULT_PROFILE.to_owned());
+        }
+        let name = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let name = name.trim();
+        validate_profile_name(name)?;
+        Ok(name.to_owned())
+    }
+
+    pub fn resolve(&self, explicit: Option<&str>) -> Result<String> {
+        match explicit {
+            Some(name) => {
+                validate_profile_name(name)?;
+                Ok(name.to_owned())
+            }
+            None => self.active_name(),
+        }
+    }
+
+    pub fn set_active(&self, name: &str) -> Result<()> {
+        let session = self.session_store(name)?.load()?;
+        ensure!(
+            session.is_some_and(|session| !session.cookie.is_empty()),
+            "profile '{name}' does not exist; create it with: jujuleaf login --profile {name}"
+        );
+        Self::write_private(&self.active_path(), format!("{name}\n").as_bytes())
+    }
+
+    pub fn list(&self) -> Result<Vec<ProfileSummary>> {
+        let active = self.active_name()?;
+        let mut profiles = BTreeMap::new();
+        for entry in std::fs::read_dir(self.profiles_dir())? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if validate_profile_name(name).is_err() {
+                continue;
+            }
+            let Some(session) = SessionStore::new(&path).load()? else {
+                continue;
+            };
+            profiles.insert(
+                name.to_owned(),
+                ProfileSummary {
+                    name: name.to_owned(),
+                    base_url: session.base_url,
+                    created_at_ms: session.created_at_ms,
+                    updated_at_ms: session.updated_at_ms,
+                    active: name == active,
+                },
+            );
+        }
+        Ok(profiles.into_values().collect())
+    }
+
+    pub fn get(&self, name: &str) -> Result<ProfileSummary> {
+        validate_profile_name(name)?;
+        self.list()?
+            .into_iter()
+            .find(|profile| profile.name == name)
+            .ok_or_else(|| anyhow!("profile '{name}' does not exist"))
+    }
+
+    pub fn delete(&self, name: &str) -> Result<()> {
+        let store = self.session_store(name)?;
+        ensure!(store.path().exists(), "profile '{name}' does not exist");
+        std::fs::remove_file(store.path())
+            .with_context(|| format!("failed to delete profile '{name}'"))?;
+        if self.active_name()? == name {
+            let remaining: Vec<_> = self
+                .list()?
+                .into_iter()
+                .map(|profile| profile.name)
+                .collect();
+            let replacement = remaining
+                .iter()
+                .find(|candidate| candidate.as_str() == DEFAULT_PROFILE)
+                .cloned()
+                .or_else(|| remaining.into_iter().next());
+            match replacement {
+                Some(replacement) => {
+                    Self::write_private(
+                        &self.active_path(),
+                        format!("{replacement}\n").as_bytes(),
+                    )?;
+                }
+                None if self.active_path().exists() => {
+                    std::fs::remove_file(self.active_path())?;
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "profile name cannot be empty");
+    ensure!(name.len() <= 64, "profile name cannot exceed 64 characters");
+    ensure!(
+        name.as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')),
+        "profile name must start with an ASCII letter or digit and contain only letters, digits, '-' or '_'"
+    );
+    Ok(())
 }
 
 pub fn find_chrome() -> Option<PathBuf> {
@@ -371,5 +575,49 @@ mod tests {
         assert_eq!(merged, "overleaf_session2=new; GCLB=route");
         let merged = merge_cookie(&merged, "GCLB=route2; Path=/");
         assert_eq!(merged, "GCLB=route2; overleaf_session2=new");
+    }
+
+    #[test]
+    fn profiles_migrate_the_single_session_and_switch_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("jujuleaf");
+        let old_store = SessionStore::new(root.join("session.json"));
+        old_store
+            .save(&Session::new("old-secret", "https://official.test/"))
+            .unwrap();
+
+        let profiles = ProfileStore::new(&root).unwrap();
+        let default = profiles.get(DEFAULT_PROFILE).unwrap();
+        assert_eq!(default.base_url, "https://official.test");
+        assert!(default.active);
+
+        profiles
+            .session_store("company")
+            .unwrap()
+            .save(&Session::new(
+                "company-secret",
+                "https://latex.company.test",
+            ))
+            .unwrap();
+        profiles.set_active("company").unwrap();
+        assert_eq!(profiles.active_name().unwrap(), "company");
+        assert!(profiles.get("company").unwrap().active);
+
+        profiles.delete("company").unwrap();
+        assert_eq!(profiles.active_name().unwrap(), DEFAULT_PROFILE);
+        assert!(profiles.get(DEFAULT_PROFILE).unwrap().active);
+    }
+
+    #[test]
+    fn profile_names_cannot_escape_the_profile_directory() {
+        for invalid in ["", ".", "../secret", "with/slash", "two words"] {
+            assert!(
+                validate_profile_name(invalid).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+        for valid in ["default", "company-prod", "lab_2", "2026"] {
+            validate_profile_name(valid).unwrap();
+        }
     }
 }
