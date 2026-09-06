@@ -325,7 +325,7 @@ Jujutsu model, synchronization state machine, and concurrency design.
 ## Acknowledgements
 
 JujuLeaf grew out of the protocol exploration and validated CodeMirror-style
-editing work in [overleaf-cli](https://github.com/CsomePro/overleaf-cli). Many
+editing work in [overleaf-cli](https://github.com/dylantmoore/overleaf-cli). Many
 thanks to that project and its contributors for establishing a practical
 foundation for interacting safely with Overleaf's web and real-time APIs.
 
