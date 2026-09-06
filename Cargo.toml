@@ -1,0 +1,39 @@
+[package]
+name = "jujuleaf"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Local-first Overleaf collaboration powered by Jujutsu"
+license = "MIT"
+repository = "https://github.com/CsomePro/jujuleaf"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+directories = "6"
+futures-util = "0.3"
+gix = { version = "0.87", default-features = false }
+hex = "0.4"
+jj-lib = "=0.45.1"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-native-roots"] }
+urlencoding = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[profile.release]
+lto = "thin"
+strip = true
