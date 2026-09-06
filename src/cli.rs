@@ -31,7 +31,9 @@ use crate::sync::{
     name = "jujuleaf",
     version,
     about = "Local-first Overleaf collaboration, powered by Jujutsu",
-    long_about = "JujuLeaf translates editor changes into Overleaf OT events and gives every local project a native Jujutsu history."
+    long_about = "JujuLeaf translates editor changes into Overleaf OT events and gives every local project a native Jujutsu history.",
+    arg_required_else_help = true,
+    after_long_help = "Examples:\n  jujuleaf login --preset cstcloud\n  jujuleaf projects\n  jujuleaf files PROJECT_ID\n  jujuleaf read PROJECT_ID main.tex --content-only\n  jujuleaf replace PROJECT_ID main.tex --old 'before' --new 'after'\n  jujuleaf clone PROJECT_ID ./paper\n\nRun `jujuleaf <COMMAND> --help` for command-specific arguments and examples."
 )]
 struct Cli {
     #[arg(
@@ -91,209 +93,339 @@ enum Command {
     Projects,
     /// Create a blank Overleaf project.
     CreateProject {
+        /// Name of the new project.
         name: String,
     },
     /// Rename an Overleaf project.
     RenameProject {
+        /// Overleaf project ID shown by `jujuleaf projects`.
         project_id: String,
+        /// New project name.
         new_name: String,
     },
-    /// List project entities.
+    /// List all documents, uploaded files, and folders in a project.
     Files {
+        /// Overleaf project ID shown by `jujuleaf projects`.
         project_id: String,
     },
     /// Read a document through the live collaboration channel.
     Read {
+        /// Overleaf project ID shown by `jujuleaf projects`.
         project_id: String,
+        /// Remote document path, for example `main.tex` or `chapters/intro.tex`.
         path: String,
         /// Print only the document text, without labels or metadata.
         #[arg(long)]
         content_only: bool,
+        /// Include document ID, OT type, version, ranges, and length metadata.
         #[arg(long)]
         meta: bool,
     },
     /// Find all overlapping exact-text matches in CodeMirror UTF-16 coordinates.
     Locate {
+        /// Overleaf project ID shown by `jujuleaf projects`.
         project_id: String,
+        /// Remote document path.
         path: String,
+        /// Exact text to find; `--old` is accepted as an alias.
         #[arg(long, alias = "old")]
         text: String,
     },
     /// Make an exact-text or full-document edit.
+    #[command(
+        after_long_help = "Examples:\n  jujuleaf edit PROJECT_ID main.tex --old 'before' --new 'after'\n  jujuleaf edit PROJECT_ID main.tex --content 'complete replacement'\n  cat main.tex | jujuleaf edit PROJECT_ID main.tex"
+    )]
     Edit(EditorArgs),
     /// Submit an edit as Overleaf tracked changes.
+    #[command(
+        after_long_help = "Example:\n  jujuleaf suggest PROJECT_ID main.tex --old 'original' --new 'suggested'"
+    )]
     Suggest(EditorArgs),
     /// Insert text at a UTF-16 position.
+    #[command(
+        after_long_help = "Example:\n  jujuleaf insert PROJECT_ID main.tex --position 120 --text 'inserted text'"
+    )]
     Insert(EditorArgs),
     /// Delete an exact match or UTF-16 range.
+    #[command(
+        after_long_help = "Examples:\n  jujuleaf delete PROJECT_ID main.tex --old 'unique text'\n  jujuleaf delete PROJECT_ID main.tex --from 120 --to 140 --old 'expected text'"
+    )]
     Delete(EditorArgs),
     /// Replace an exact match or UTF-16 range.
+    #[command(
+        after_long_help = "Examples:\n  jujuleaf replace PROJECT_ID main.tex --old 'before' --new 'after'\n  jujuleaf replace PROJECT_ID main.tex --old 'term' --new 'word' --occurrence 2\n  jujuleaf replace PROJECT_ID main.tex --from 120 --to 126 --new 'replacement'"
+    )]
     Replace(EditorArgs),
     /// Apply ordered CodeMirror-style changes.
+    #[command(
+        after_long_help = "Example:\n  jujuleaf apply-changes PROJECT_ID main.tex --changes '[{\"from\":10,\"to\":16,\"insert\":\"new\",\"expect\":\"oldest\"}]'"
+    )]
     ApplyChanges(EditorArgs),
     /// Validate and submit raw OT wire operations.
+    #[command(
+        after_long_help = "Advanced command. Prefer `replace`, `insert`, `delete`, or `apply-changes` unless you already have operations encoded for the document's active OT format."
+    )]
     ApplyOps(EditorArgs),
     /// Accept tracked changes by ID.
     AcceptChanges {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document ID shown by `files` or `read --meta`.
         doc_id: String,
+        /// One or more tracked-change IDs to accept.
         #[arg(required = true)]
         change_ids: Vec<String>,
     },
+    /// Create an empty text document in the project root or a folder.
     CreateDoc {
+        /// Overleaf project ID.
         project_id: String,
+        /// New document name, including extension.
         name: String,
+        /// Parent folder ID; defaults to the project root folder.
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Permanently delete a text document by document ID.
     DeleteDoc {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document ID shown by `jujuleaf files PROJECT_ID`.
         doc_id: String,
     },
+    /// Create a folder in the project root or another folder.
     CreateFolder {
+        /// Overleaf project ID.
         project_id: String,
+        /// New folder name.
         name: String,
+        /// Parent folder ID; defaults to the project root folder.
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Permanently delete a folder by folder ID.
     DeleteFolder {
+        /// Overleaf project ID.
         project_id: String,
+        /// Folder ID shown by `jujuleaf files PROJECT_ID`.
         folder_id: String,
     },
+    /// Rename a document, uploaded file, or folder by entity ID.
     Rename {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document, uploaded-file, or folder ID.
         entity_id: String,
+        /// New entity name.
         name: String,
+        /// Entity kind associated with ENTITY_ID.
         #[arg(long, value_enum, default_value_t = EntityType::Doc)]
         r#type: EntityType,
     },
+    /// Move a document, uploaded file, or folder into another folder.
     Move {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document, uploaded-file, or folder ID to move.
         entity_id: String,
+        /// Destination folder ID.
         folder_id: String,
+        /// Entity kind associated with ENTITY_ID.
         #[arg(long, value_enum, default_value_t = EntityType::Doc)]
         r#type: EntityType,
     },
+    /// Upload a local file to the project root or a folder.
     Upload {
+        /// Overleaf project ID.
         project_id: String,
+        /// Path to the local file to upload.
         local_path: PathBuf,
+        /// Remote filename; defaults to the local filename.
         #[arg(long)]
         name: Option<String>,
+        /// Destination folder ID; defaults to the project root folder.
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Download a remote text document to a local file.
     Download {
+        /// Overleaf project ID.
         project_id: String,
+        /// Remote document path.
         path: String,
+        /// Local output path; defaults to the remote document filename.
         #[arg(short = 'o', long)]
         output: Option<PathBuf>,
     },
+    /// Compile a project and show Overleaf compile-result metadata.
     Compile {
+        /// Overleaf project ID.
         project_id: String,
+        /// Request Overleaf's faster draft compilation mode.
         #[arg(long)]
         draft: bool,
     },
+    /// Compile a project and download the resulting PDF.
     Pdf {
+        /// Overleaf project ID.
         project_id: String,
+        /// Local PDF path.
         #[arg(short = 'o', long, default_value = "output.pdf")]
         output: PathBuf,
     },
+    /// Download the complete project source as a ZIP archive.
     Zip {
+        /// Overleaf project ID.
         project_id: String,
+        /// Local ZIP path.
         #[arg(short = 'o', long, default_value = "project.zip")]
         output: PathBuf,
     },
+    /// List comment threads and their messages for a project.
     Threads {
+        /// Overleaf project ID.
         project_id: String,
     },
+    /// Add a message to an existing comment thread.
     Comment {
+        /// Overleaf project ID.
         project_id: String,
+        /// Existing thread ID shown by `jujuleaf threads PROJECT_ID`.
         thread_id: String,
+        /// Message text; multiple words are joined with spaces.
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Create a comment thread anchored to exact text or a UTF-16 range.
     AddComment {
+        /// Overleaf project ID.
         project_id: String,
+        /// Remote document path.
         path: String,
+        /// Comment text; put selector options before this trailing text.
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
+        /// Anchor the comment to an exact text match.
         #[arg(long)]
         at_text: Option<String>,
+        /// Anchor start in CodeMirror UTF-16 units.
         #[arg(long)]
         position: Option<usize>,
+        /// Anchor length in UTF-16 units; defaults to 20 with `--position`.
         #[arg(long)]
         length: Option<usize>,
+        /// Select a 1-based occurrence when `--at-text` is not unique.
         #[arg(long)]
         occurrence: Option<usize>,
     },
+    /// Mark a comment thread as resolved.
     ResolveThread {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document ID containing the thread.
         doc_id: String,
+        /// Thread ID shown by `jujuleaf threads PROJECT_ID`.
         thread_id: String,
     },
+    /// Reopen a resolved comment thread.
     ReopenThread {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document ID containing the thread.
         doc_id: String,
+        /// Thread ID shown by `jujuleaf threads PROJECT_ID`.
         thread_id: String,
     },
+    /// Permanently delete a comment thread.
     DeleteThread {
+        /// Overleaf project ID.
         project_id: String,
+        /// Document ID containing the thread.
         doc_id: String,
+        /// Thread ID shown by `jujuleaf threads PROJECT_ID`.
         thread_id: String,
     },
+    /// Replace the text of an existing comment message.
     EditComment {
+        /// Overleaf project ID.
         project_id: String,
+        /// Thread ID containing the message.
         thread_id: String,
+        /// Message ID shown by `jujuleaf threads PROJECT_ID`.
         message_id: String,
+        /// Replacement message text; multiple words are joined with spaces.
         #[arg(required = true, trailing_var_arg = true)]
         text: Vec<String>,
     },
+    /// Permanently delete a comment message.
     DeleteComment {
+        /// Overleaf project ID.
         project_id: String,
+        /// Thread ID containing the message.
         thread_id: String,
+        /// Message ID shown by `jujuleaf threads PROJECT_ID`.
         message_id: String,
     },
+    /// Show remote document changes between two project-history versions.
     Diff {
+        /// Overleaf project ID.
         project_id: String,
+        /// Remote document path.
         path: String,
+        /// Starting project-history version.
         #[arg(long, default_value_t = 0)]
         from: i64,
+        /// Ending version; defaults to the latest reported project version.
         #[arg(long)]
         to: Option<i64>,
     },
+    /// Search text-like files in a downloaded project snapshot.
     Search {
+        /// Overleaf project ID.
         project_id: String,
+        /// Literal, case-sensitive search query; words are joined with spaces.
         #[arg(required = true, trailing_var_arg = true)]
         query: Vec<String>,
     },
+    /// Stream live collaboration events until interrupted.
     Watch {
+        /// Overleaf project ID.
         project_id: String,
     },
+    /// Show recent remote project update batches.
     History {
+        /// Overleaf project ID.
         project_id: String,
+        /// Minimum number of update batches to request.
         #[arg(long, default_value_t = 10)]
         min_count: usize,
     },
+    /// Show Overleaf's word-count result for a project.
     Wordcount {
+        /// Overleaf project ID.
         project_id: String,
     },
 
     /// Clone an Overleaf project into a native .jj workspace.
     #[command(visible_alias = "init")]
     Clone {
+        /// Overleaf project ID shown by `jujuleaf projects`.
         project_id: String,
+        /// Empty or new destination directory.
         #[arg(default_value = ".")]
         destination: PathBuf,
     },
     /// Pull remote documents without overwriting concurrent local edits.
     #[command(visible_alias = "fetch")]
     Pull {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Push local documents with version/hash conflict protection.
     #[command(visible_alias = "publish")]
     Push {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
         #[command(flatten)]
@@ -301,6 +433,7 @@ enum Command {
     },
     /// Pull then push when no conflicts are present.
     Sync {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
         #[command(flatten)]
@@ -308,23 +441,28 @@ enum Command {
     },
     /// Compare local files with the last confirmed remote checkpoint.
     Status {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Record the current local files as a Jujutsu checkpoint.
     Checkpoint {
+        /// Description stored with the Jujutsu checkpoint.
         #[arg(short, long, default_value = "manual checkpoint")]
         message: String,
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Restore the previous Jujutsu operation.
     Undo {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
     /// Restore the operation most recently undone by JujuLeaf.
     Redo {
+        /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
     },
@@ -335,44 +473,69 @@ enum ProfileCommand {
     /// List profiles without exposing cookies.
     List,
     /// Set the active profile used outside a bound local clone.
-    Use { name: String },
+    Use {
+        /// Profile name to make active.
+        name: String,
+    },
     /// Show profile metadata without exposing its cookie.
     #[command(visible_alias = "current")]
-    Show { name: Option<String> },
+    Show {
+        /// Profile name; defaults to the selected or active profile.
+        name: Option<String>,
+    },
     /// Delete a saved profile. Local clones and remote sessions are untouched.
-    Delete { name: String },
+    Delete {
+        /// Profile name to remove from local configuration.
+        name: String,
+    },
 }
 
 #[derive(Args, Debug, Clone)]
 struct EditorArgs {
+    /// Overleaf project ID shown by `jujuleaf projects`.
     project_id: String,
+    /// Remote document path.
     path: String,
+    /// Full document, inserted, or replacement content depending on the command.
     #[arg(long)]
     content: Option<String>,
+    /// Inserted or replacement text; an alternative to `--content`.
     #[arg(long)]
     text: Option<String>,
+    /// Exact source text to replace/delete, or expected text for a range edit.
     #[arg(long)]
     old: Option<String>,
+    /// Replacement text used with `--old`.
     #[arg(long)]
     new: Option<String>,
+    /// Range start in CodeMirror UTF-16 units.
     #[arg(long)]
     from: Option<usize>,
+    /// Exclusive range end in CodeMirror UTF-16 units.
     #[arg(long)]
     to: Option<usize>,
+    /// Exact-match start or range start in CodeMirror UTF-16 units.
     #[arg(long)]
     position: Option<usize>,
+    /// Range length in UTF-16 units.
     #[arg(long)]
     length: Option<usize>,
+    /// Select a 1-based occurrence when `--old` is not unique.
     #[arg(long)]
     occurrence: Option<usize>,
+    /// Apply the same exact-text operation to every occurrence.
     #[arg(long)]
     all: bool,
+    /// JSON array of ordered `{from,to,insert,expect}` changes for `apply-changes`.
     #[arg(long)]
     changes: Option<String>,
+    /// JSON array of advanced Overleaf OT wire operations for `apply-ops`.
     #[arg(long)]
     ops: Option<String>,
+    /// Encode the operation as tracked changes when the OT format supports it.
     #[arg(long)]
     tracked: bool,
+    /// Validate and display generated operations without sending them.
     #[arg(long)]
     dry_run: bool,
     #[command(flatten)]
@@ -381,8 +544,10 @@ struct EditorArgs {
 
 #[derive(Args, Debug, Clone)]
 struct RetryArgs {
+    /// Overall confirmation timeout in milliseconds.
     #[arg(long, default_value_t = 45_000)]
     timeout: u64,
+    /// Delay before checking an uncertain update again, in milliseconds.
     #[arg(long, default_value_t = 5_000)]
     retry_after: u64,
 }
@@ -400,8 +565,11 @@ impl RetryArgs {
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum EntityType {
+    /// Collaborative text document.
     Doc,
+    /// Uploaded file.
     File,
+    /// Folder.
     Folder,
 }
 
@@ -1550,6 +1718,38 @@ mod tests {
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_visible_subcommand_and_argument_has_help() {
+        fn check(command: &clap::Command, path: &str) {
+            for subcommand in command
+                .get_subcommands()
+                .filter(|command| !command.is_hide_set())
+            {
+                if subcommand.get_name() == "help" {
+                    continue;
+                }
+                let subcommand_path = format!("{path} {}", subcommand.get_name());
+                assert!(
+                    subcommand.get_about().is_some(),
+                    "{subcommand_path} has no help summary"
+                );
+                for argument in subcommand
+                    .get_arguments()
+                    .filter(|argument| !argument.is_hide_set())
+                {
+                    assert!(
+                        argument.get_help().is_some(),
+                        "{subcommand_path} argument '{}' has no help",
+                        argument.get_id()
+                    );
+                }
+                check(subcommand, &subcommand_path);
+            }
+        }
+
+        check(&Cli::command(), "jujuleaf");
     }
 
     #[test]
