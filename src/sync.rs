@@ -20,6 +20,7 @@ use crate::store::{AssetCheckpoint, SyncStore, bytes_hash, content_hash};
 
 const STATE_DIR: &str = ".jj/jujuleaf";
 const METADATA_FILE: &str = ".jujuleaf/remote-metadata.json";
+const PROJECT_CONTEXT_FILE: &str = ".jujuleaf/project.json";
 
 pub(crate) struct WorkspaceOperationLock {
     _file: File,
@@ -71,6 +72,20 @@ struct RemoteMetadataManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ProjectContextManifest {
+    schema_version: u32,
+    project_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectContext {
+    pub root: PathBuf,
+    pub project_id: String,
+    pub profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProjectBinding {
     pub project_id: String,
     pub base_url: String,
@@ -102,6 +117,19 @@ impl ProjectBinding {
         )
         .with_context(|| format!("invalid {}", path.display()))
     }
+}
+
+fn save_project_context(root: &Path, project_id: &str) -> Result<()> {
+    let path = root.join(PROJECT_CONTEXT_FILE);
+    std::fs::create_dir_all(path.parent().expect("context has parent"))?;
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&ProjectContextManifest {
+            schema_version: 1,
+            project_id: project_id.to_owned(),
+        })?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +351,72 @@ pub fn discover_root(start: impl AsRef<Path>) -> Result<PathBuf> {
     }
 }
 
+pub fn discover_project_context(start: impl AsRef<Path>) -> Result<Option<ProjectContext>> {
+    let mut current = start
+        .as_ref()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", start.as_ref().display()))?;
+    loop {
+        let binding_path = ProjectBinding::path(&current);
+        if binding_path.exists() {
+            let binding = ProjectBinding::load(&current)?;
+            return Ok(Some(ProjectContext {
+                root: current,
+                project_id: binding.project_id,
+                profile: Some(binding.profile),
+            }));
+        }
+
+        let context_path = current.join(PROJECT_CONTEXT_FILE);
+        if context_path.exists() {
+            let context: ProjectContextManifest = serde_json::from_slice(
+                &std::fs::read(&context_path)
+                    .with_context(|| format!("failed to read {}", context_path.display()))?,
+            )
+            .with_context(|| format!("invalid {}", context_path.display()))?;
+            ensure!(
+                context.schema_version == 1,
+                "unsupported schemaVersion {} in {}",
+                context.schema_version,
+                context_path.display()
+            );
+            ensure!(
+                !context.project_id.trim().is_empty(),
+                "projectId is empty in {}",
+                context_path.display()
+            );
+            return Ok(Some(ProjectContext {
+                root: current,
+                project_id: context.project_id,
+                profile: None,
+            }));
+        }
+
+        let metadata_path = current.join(METADATA_FILE);
+        if metadata_path.exists() {
+            let metadata: Value = serde_json::from_slice(
+                &std::fs::read(&metadata_path)
+                    .with_context(|| format!("failed to read {}", metadata_path.display()))?,
+            )
+            .with_context(|| format!("invalid {}", metadata_path.display()))?;
+            let project_id = metadata
+                .get("projectId")
+                .and_then(Value::as_str)
+                .filter(|project_id| !project_id.trim().is_empty())
+                .ok_or_else(|| anyhow!("projectId is missing in {}", metadata_path.display()))?;
+            return Ok(Some(ProjectContext {
+                root: current,
+                project_id: project_id.to_owned(),
+                profile: None,
+            }));
+        }
+
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
 fn write_document(root: &Path, remote_path: &str, content: &str) -> Result<()> {
     let path = local_path(root, remote_path)?;
     if let Some(parent) = path.parent() {
@@ -436,6 +530,7 @@ pub async fn clone_project(
         profile: profile.to_owned(),
     };
     let mut workspace = JjWorkspace::init(destination).await?;
+    save_project_context(destination, project_id)?;
     binding.save(destination)?;
     let checkpoint = workspace
         .checkpoint(&format!("clone Overleaf project {project_id}"))
@@ -1259,6 +1354,72 @@ mod tests {
         let nested = temp.path().join("chapters");
         std::fs::create_dir(&nested).unwrap();
         assert_eq!(discover_root(&nested).unwrap(), temp.path());
+        assert_eq!(
+            discover_project_context(&nested).unwrap(),
+            Some(ProjectContext {
+                root: temp.path().canonicalize().unwrap(),
+                project_id: "p1".into(),
+                profile: Some(DEFAULT_PROFILE.into()),
+            })
+        );
+    }
+
+    #[test]
+    fn public_project_context_supports_discovery_without_private_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let context_dir = temp.path().join(".jujuleaf");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        std::fs::write(
+            context_dir.join("project.json"),
+            br#"{"schemaVersion":1,"projectId":"public-project"}"#,
+        )
+        .unwrap();
+        let nested = temp.path().join("chapters");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert_eq!(
+            discover_project_context(&nested).unwrap(),
+            Some(ProjectContext {
+                root: temp.path().canonicalize().unwrap(),
+                project_id: "public-project".into(),
+                profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn old_remote_metadata_can_supply_the_project_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let context_dir = temp.path().join(".jujuleaf");
+        std::fs::create_dir_all(&context_dir).unwrap();
+        std::fs::write(
+            temp.path().join(METADATA_FILE),
+            br#"{"schemaVersion":1,"projectId":"legacy-project"}"#,
+        )
+        .unwrap();
+        let nested = temp.path().join("chapters");
+        std::fs::create_dir(&nested).unwrap();
+
+        assert_eq!(
+            discover_project_context(&nested).unwrap(),
+            Some(ProjectContext {
+                root: temp.path().canonicalize().unwrap(),
+                project_id: "legacy-project".into(),
+                profile: None,
+            })
+        );
+    }
+
+    #[test]
+    fn public_project_context_contains_no_account_details() {
+        let temp = tempfile::tempdir().unwrap();
+        save_project_context(temp.path(), "p1").unwrap();
+
+        let manifest: ProjectContextManifest =
+            serde_json::from_slice(&std::fs::read(temp.path().join(PROJECT_CONTEXT_FILE)).unwrap())
+                .unwrap();
+        assert_eq!(manifest.schema_version, 1);
+        assert_eq!(manifest.project_id, "p1");
     }
 
     #[test]

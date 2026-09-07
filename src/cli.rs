@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use std::fmt::Write as _;
+use std::ffi::OsString;
 use std::io::{Cursor, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde::Serialize;
+use clap::{Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
@@ -20,6 +19,7 @@ use crate::operations::{
     parse_document_snapshot, slice_utf16, utf16_len, validate_history_operations,
     visible_to_source_position,
 };
+use crate::output::{OutputMode, notice, output};
 use crate::project::{collect_documents, connect_project_with_api, find_document, root_folder_id};
 use crate::review::{
     abort_review, begin_review, ensure_sync_allowed, finish_review_with_api, review_diff_with_api,
@@ -27,8 +27,8 @@ use crate::review::{
 };
 use crate::socket::UpdateOptions;
 use crate::sync::{
-    ProjectBinding, WorkspaceOperationLock, clone_project, discover_root, local_status,
-    pull_project_with_api, push_project_with_api,
+    ProjectBinding, WorkspaceOperationLock, clone_project, discover_project_context, discover_root,
+    local_status, pull_project_with_api, push_project_with_api,
 };
 
 #[derive(Parser)]
@@ -38,7 +38,7 @@ use crate::sync::{
     about = "Local-first Overleaf collaboration, powered by Jujutsu",
     long_about = "JujuLeaf translates editor changes into Overleaf OT events and gives every local project a native Jujutsu history.",
     arg_required_else_help = true,
-    after_long_help = "Examples:\n  jujuleaf login --preset cstcloud\n  jujuleaf projects\n  jujuleaf files PROJECT_ID\n  jujuleaf read PROJECT_ID main.tex --content-only\n  jujuleaf replace PROJECT_ID main.tex --old 'before' --new 'after'\n  jujuleaf clone PROJECT_ID ./paper\n\nRun `jujuleaf <COMMAND> --help` for command-specific arguments and examples."
+    after_long_help = "Examples:\n  jujuleaf login --preset cstcloud\n  jujuleaf projects\n  jujuleaf files PROJECT_ID\n  jujuleaf read PROJECT_ID main.tex --content-only\n  jujuleaf replace PROJECT_ID main.tex --old 'before' --new 'after'\n  jujuleaf clone PROJECT_ID ./paper\n\nInside a JujuLeaf clone or child directory, omit PROJECT_ID (for example: `jujuleaf read main.tex`). Use `--project-id` to override the detected project.\n\nRun `jujuleaf <COMMAND> --help` for command-specific arguments and examples."
 )]
 struct Cli {
     #[arg(
@@ -60,6 +60,21 @@ struct Cli {
     #[arg(
         long,
         global = true,
+        help = "Disable ANSI colors in human-readable output"
+    )]
+    no_color: bool,
+
+    #[arg(
+        long = "project-id",
+        global = true,
+        value_name = "PROJECT_ID",
+        help = "Override the project detected from the current JujuLeaf clone"
+    )]
+    project: Option<String>,
+
+    #[arg(
+        long,
+        global = true,
         value_name = "NAME",
         help = "Use a named Overleaf account/endpoint profile"
     )]
@@ -67,6 +82,254 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug)]
+struct PreparedCliArgs {
+    arguments: Vec<OsString>,
+    context_profile: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProjectArgumentShape {
+    Fixed(usize),
+    Variadic(usize),
+}
+
+fn project_argument_shape(command: &str) -> Option<ProjectArgumentShape> {
+    use ProjectArgumentShape::{Fixed, Variadic};
+
+    match command {
+        "files" | "compile" | "pdf" | "zip" | "threads" | "watch" | "history" | "wordcount" => {
+            Some(Fixed(0))
+        }
+        "rename-project" | "read" | "locate" | "edit" | "suggest" | "insert" | "delete"
+        | "replace" | "apply-changes" | "apply-ops" | "create-doc" | "delete-doc"
+        | "delete-file" | "create-folder" | "delete-folder" | "upload" | "download" | "diff" => {
+            Some(Fixed(1))
+        }
+        "rename" | "move" | "resolve-thread" | "reopen-thread" | "delete-thread"
+        | "delete-comment" => Some(Fixed(2)),
+        "accept-changes" | "comment" | "add-comment" => Some(Variadic(2)),
+        "edit-comment" => Some(Variadic(3)),
+        "search" => Some(Variadic(1)),
+        _ => None,
+    }
+}
+
+fn command_index(arguments: &[OsString]) -> Option<(usize, &str)> {
+    let mut index = 1;
+    while index < arguments.len() {
+        let argument = arguments[index].to_str()?;
+        if matches!(argument, "--profile" | "--project-id") {
+            index += 2;
+        } else if argument.starts_with("--profile=")
+            || argument.starts_with("--project-id=")
+            || argument.starts_with('-')
+        {
+            index += 1;
+        } else {
+            return Some((index, argument));
+        }
+    }
+    None
+}
+
+fn option_takes_separate_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--profile"
+            | "--project-id"
+            | "--cookie"
+            | "--base-url"
+            | "--preset"
+            | "--content"
+            | "--text"
+            | "--old"
+            | "--new"
+            | "--from"
+            | "--to"
+            | "--position"
+            | "--length"
+            | "--occurrence"
+            | "--changes"
+            | "--ops"
+            | "--timeout"
+            | "--retry-after"
+            | "--parent"
+            | "--type"
+            | "--name"
+            | "--output"
+            | "--log-output"
+            | "--at-text"
+            | "--min-count"
+            | "-o"
+    )
+}
+
+fn positional_indices(arguments: &[OsString], command_index: usize) -> Vec<usize> {
+    let mut positions = Vec::new();
+    let mut index = command_index + 1;
+    let mut positional_only = false;
+    while index < arguments.len() {
+        let Some(argument) = arguments[index].to_str() else {
+            positions.push(index);
+            index += 1;
+            continue;
+        };
+        if positional_only {
+            positions.push(index);
+            index += 1;
+        } else if argument == "--" {
+            positional_only = true;
+            index += 1;
+        } else if argument.starts_with('-') {
+            index += if !argument.contains('=') && option_takes_separate_value(argument) {
+                2
+            } else {
+                1
+            };
+        } else {
+            positions.push(index);
+            index += 1;
+        }
+    }
+    positions
+}
+
+fn project_override(arguments: &[OsString]) -> Result<Option<String>> {
+    let mut project = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        let Some(argument) = arguments[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if argument == "--" {
+            break;
+        }
+        let value = if argument == "--project-id" {
+            let value = arguments
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .ok_or_else(|| anyhow!("--project-id requires a UTF-8 value"))?;
+            index += 2;
+            Some(value)
+        } else if let Some(value) = argument.strip_prefix("--project-id=") {
+            index += 1;
+            Some(value)
+        } else {
+            index += 1;
+            None
+        };
+        if let Some(value) = value {
+            ensure!(project.is_none(), "--project-id may only be specified once");
+            ensure!(!value.is_empty(), "--project-id cannot be empty");
+            project = Some(value.to_owned());
+        }
+    }
+    Ok(project)
+}
+
+fn positional_text<'a>(arguments: &'a [OsString], positions: &[usize]) -> Option<&'a str> {
+    positions
+        .first()
+        .and_then(|index| arguments[*index].to_str())
+}
+
+fn prepare_cli_args(
+    arguments: impl IntoIterator<Item = OsString>,
+    current_dir: &Path,
+) -> Result<PreparedCliArgs> {
+    let mut arguments: Vec<_> = arguments.into_iter().collect();
+    if arguments
+        .iter()
+        .any(|argument| matches!(argument.to_str(), Some("-h" | "--help" | "--version")))
+    {
+        return Ok(PreparedCliArgs {
+            arguments,
+            context_profile: None,
+        });
+    }
+
+    let Some((command_index, command)) = command_index(&arguments) else {
+        return Ok(PreparedCliArgs {
+            arguments,
+            context_profile: None,
+        });
+    };
+    let Some(shape) = project_argument_shape(command) else {
+        return Ok(PreparedCliArgs {
+            arguments,
+            context_profile: None,
+        });
+    };
+    let positions = positional_indices(&arguments, command_index);
+    let project_override = project_override(&arguments)?;
+
+    let needs_project = match shape {
+        ProjectArgumentShape::Fixed(other_count) => positions.len() == other_count,
+        ProjectArgumentShape::Variadic(minimum_other_count) => {
+            positions.len() >= minimum_other_count
+        }
+    };
+    if !needs_project {
+        if let (ProjectArgumentShape::Fixed(other_count), Some(project_override)) =
+            (shape, project_override.as_deref())
+            && positions.len() == other_count + 1
+        {
+            ensure!(
+                positional_text(&arguments, &positions) == Some(project_override),
+                "project ID was provided both positionally and with --project-id"
+            );
+        }
+        return Ok(PreparedCliArgs {
+            arguments,
+            context_profile: None,
+        });
+    }
+
+    let (project_id, context_profile, from_context) = if let Some(project_id) = project_override {
+        (project_id, None, false)
+    } else if let Some(context) = discover_project_context(current_dir)? {
+        (context.project_id, context.profile, true)
+    } else {
+        return Ok(PreparedCliArgs {
+            arguments,
+            context_profile: None,
+        });
+    };
+
+    let already_positional = match shape {
+        ProjectArgumentShape::Fixed(_) => false,
+        ProjectArgumentShape::Variadic(minimum_other_count) => {
+            positions.len() > minimum_other_count
+                && positional_text(&arguments, &positions) == Some(project_id.as_str())
+        }
+    };
+    if !already_positional {
+        arguments.insert(command_index + 1, OsString::from(project_id));
+    }
+
+    Ok(PreparedCliArgs {
+        arguments,
+        context_profile: from_context.then_some(context_profile).flatten(),
+    })
+}
+
+fn parse_cli(arguments: Vec<OsString>) -> Cli {
+    let no_color = std::env::var_os("NO_COLOR").is_some()
+        || arguments
+            .iter()
+            .any(|argument| matches!(argument.to_str(), Some("--no-color" | "--raw" | "--pretty")));
+    let matches = Cli::command()
+        .color(if no_color {
+            ColorChoice::Never
+        } else {
+            ColorChoice::Auto
+        })
+        .get_matches_from(arguments);
+    Cli::from_arg_matches(&matches).expect("clap matches the derived CLI")
 }
 
 #[derive(Subcommand)]
@@ -683,200 +946,6 @@ enum EditorCommand {
     ApplyOps,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutputMode {
-    Human,
-    RawJson,
-    PrettyJson,
-}
-
-impl OutputMode {
-    fn from_flags(raw: bool, pretty: bool) -> Self {
-        if raw {
-            Self::RawJson
-        } else if pretty {
-            Self::PrettyJson
-        } else {
-            Self::Human
-        }
-    }
-}
-
-fn human_label(key: &str) -> String {
-    let key = key.trim_start_matches('_');
-    let mut label = String::new();
-    let mut previous_was_lowercase = false;
-    for character in key.chars() {
-        if character == '_' || character == '-' {
-            if !label.ends_with(' ') {
-                label.push(' ');
-            }
-            previous_was_lowercase = false;
-        } else {
-            if character.is_uppercase() && previous_was_lowercase {
-                label.push(' ');
-            }
-            label.extend(character.to_uppercase());
-            previous_was_lowercase = character.is_lowercase() || character.is_ascii_digit();
-        }
-    }
-    label
-}
-
-fn human_scalar(value: &Value) -> String {
-    match value {
-        Value::Null => "-".to_owned(),
-        Value::Bool(true) => "yes".to_owned(),
-        Value::Bool(false) => "no".to_owned(),
-        Value::Number(number) => number.to_string(),
-        Value::String(string) => string.clone(),
-        Value::Array(_) | Value::Object(_) => {
-            serde_json::to_string(value).unwrap_or_else(|_| "-".to_owned())
-        }
-    }
-}
-
-fn table_columns(rows: &[Value]) -> Option<Vec<String>> {
-    let mut columns = Vec::new();
-    for row in rows {
-        let object = row.as_object()?;
-        if object.values().any(Value::is_array) || object.values().any(Value::is_object) {
-            return None;
-        }
-        for key in object.keys() {
-            if !columns.contains(key) {
-                columns.push(key.clone());
-            }
-        }
-    }
-    (!columns.is_empty() && columns.len() <= 8).then_some(columns)
-}
-
-fn write_table(output: &mut String, rows: &[Value], indent: usize) {
-    if rows.is_empty() {
-        let _ = writeln!(output, "{}(none)", " ".repeat(indent));
-        return;
-    }
-    let Some(columns) = table_columns(rows) else {
-        for (index, row) in rows.iter().enumerate() {
-            let _ = writeln!(output, "{}[{}]", " ".repeat(indent), index + 1);
-            write_human_value(output, row, indent + 2);
-        }
-        return;
-    };
-    let headers: Vec<_> = columns.iter().map(|column| human_label(column)).collect();
-    let cells: Vec<Vec<_>> = rows
-        .iter()
-        .map(|row| {
-            let object = row.as_object().expect("table rows are objects");
-            columns
-                .iter()
-                .map(|column| object.get(column).map(human_scalar).unwrap_or_default())
-                .collect()
-        })
-        .collect();
-    let widths: Vec<_> = (0..columns.len())
-        .map(|index| {
-            cells
-                .iter()
-                .map(|row| row[index].chars().count())
-                .chain(std::iter::once(headers[index].chars().count()))
-                .max()
-                .unwrap_or_default()
-        })
-        .collect();
-    let write_row = |output: &mut String, row: &[String]| {
-        output.push_str(&" ".repeat(indent));
-        for (index, cell) in row.iter().enumerate() {
-            output.push_str(cell);
-            if index + 1 < row.len() {
-                output
-                    .push_str(&" ".repeat(widths[index].saturating_sub(cell.chars().count()) + 2));
-            }
-        }
-        output.push('\n');
-    };
-    write_row(output, &headers);
-    write_row(
-        output,
-        &widths
-            .iter()
-            .map(|width| "-".repeat(*width))
-            .collect::<Vec<_>>(),
-    );
-    for row in cells {
-        write_row(output, &row);
-    }
-}
-
-fn write_human_value(output: &mut String, value: &Value, indent: usize) {
-    match value {
-        Value::Object(object) => {
-            for (key, value) in object
-                .iter()
-                .filter(|(_, value)| !value.is_array() && !value.is_object())
-            {
-                let _ = writeln!(
-                    output,
-                    "{}{}: {}",
-                    " ".repeat(indent),
-                    human_label(key),
-                    human_scalar(value)
-                );
-            }
-            for (key, value) in object
-                .iter()
-                .filter(|(_, value)| value.is_array() || value.is_object())
-            {
-                if !output.is_empty() && !output.ends_with("\n\n") {
-                    output.push('\n');
-                }
-                match value {
-                    Value::Array(values) => {
-                        let _ = writeln!(
-                            output,
-                            "{}{} ({})",
-                            " ".repeat(indent),
-                            human_label(key),
-                            values.len()
-                        );
-                        if values.is_empty() {
-                            let _ = writeln!(output, "{}(none)", " ".repeat(indent + 2));
-                        } else {
-                            write_table(output, values, indent + 2);
-                        }
-                    }
-                    Value::Object(_) => {
-                        let _ = writeln!(output, "{}{}", " ".repeat(indent), human_label(key));
-                        write_human_value(output, value, indent + 2);
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-        Value::Array(values) => write_table(output, values, indent),
-        _ => {
-            let _ = writeln!(output, "{}{}", " ".repeat(indent), human_scalar(value));
-        }
-    }
-}
-
-fn render_human(value: &Value) -> String {
-    let mut rendered = String::new();
-    write_human_value(&mut rendered, value, 0);
-    rendered.trim_end().to_owned()
-}
-
-fn output(value: impl Serialize, mode: OutputMode) -> Result<()> {
-    let value = serde_json::to_value(value)?;
-    match mode {
-        OutputMode::Human => println!("{}", render_human(&value)),
-        OutputMode::RawJson => println!("{}", serde_json::to_string(&value)?),
-        OutputMode::PrettyJson => println!("{}", serde_json::to_string_pretty(&value)?),
-    }
-    Ok(())
-}
-
 async fn stdin_text() -> Result<Option<String>> {
     if std::io::stdin().is_terminal() {
         return Ok(None);
@@ -1076,10 +1145,14 @@ async fn authenticated(
 fn selected_profile(
     profiles: &ProfileStore,
     explicit: Option<&str>,
+    context_profile: Option<&str>,
     command: &Command,
 ) -> Result<String> {
     if let Some(explicit) = explicit {
         return profiles.resolve(Some(explicit));
+    }
+    if let Some(context_profile) = context_profile {
+        return profiles.resolve(Some(context_profile));
     }
     let path: Option<&Path> = match command {
         Command::Pull { path } | Command::Push { path, .. } | Command::Sync { path, .. } => {
@@ -1273,9 +1346,12 @@ fn search_zip(zip: &[u8], query: &str) -> Result<Value> {
 }
 
 pub async fn run() -> Result<()> {
-    let cli = Cli::parse();
-    let pretty = OutputMode::from_flags(cli.raw, cli.pretty);
+    let prepared = prepare_cli_args(std::env::args_os(), &std::env::current_dir()?)?;
+    let context_profile = prepared.context_profile;
+    let cli = parse_cli(prepared.arguments);
+    let pretty = OutputMode::from_flags(cli.raw, cli.pretty, cli.no_color);
     let explicit_profile = cli.profile;
+    let _project_override = cli.project;
     match cli.command {
         Command::Login {
             cookie,
@@ -1288,7 +1364,7 @@ pub async fn run() -> Result<()> {
             let cookie = match cookie {
                 Some(cookie) => cookie,
                 None => {
-                    eprintln!("Opening Chrome for Overleaf sign-in…");
+                    notice("Opening Chrome for Overleaf sign-in…", pretty);
                     interactive_login(&base_url, preset).await?
                 }
             };
@@ -1377,7 +1453,12 @@ pub async fn run() -> Result<()> {
         }
         command => {
             let profiles = ProfileStore::from_default_path()?;
-            let profile = selected_profile(&profiles, explicit_profile.as_deref(), &command)?;
+            let profile = selected_profile(
+                &profiles,
+                explicit_profile.as_deref(),
+                context_profile.as_deref(),
+                &command,
+            )?;
             let (_store, session, mut api) = authenticated(&profiles, &profile).await?;
             dispatch_authenticated(command, session, &profile, &mut api, pretty).await
         }
@@ -1777,9 +1858,12 @@ async fn dispatch_authenticated(
             for document in &documents {
                 socket.join_doc(&document.id).await?;
             }
-            eprintln!(
-                "Watching {} documents. Press Ctrl+C to stop.",
-                documents.len()
+            notice(
+                &format!(
+                    "Watching {} documents. Press Ctrl+C to stop.",
+                    documents.len()
+                ),
+                pretty,
             );
             loop {
                 let event = socket.next_event().await?;
@@ -1925,18 +2009,29 @@ async fn dispatch_authenticated(
     }
 }
 
-pub fn print_json_error(error: &anyhow::Error) {
-    eprintln!("{}", json!({"error": format!("{error:#}")}));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn cli_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn every_remote_project_command_supports_context_discovery() {
+        for command in Cli::command().get_subcommands() {
+            let requires_project_id = command
+                .get_arguments()
+                .any(|argument| argument.get_id() == "project_id");
+            if requires_project_id && command.get_name() != "clone" {
+                assert!(
+                    project_argument_shape(command.get_name()).is_some(),
+                    "{} is missing project context support",
+                    command.get_name()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2039,17 +2134,23 @@ mod tests {
     #[test]
     fn output_defaults_to_human_and_raw_is_machine_json() {
         let cli = Cli::try_parse_from(["jujuleaf", "projects"]).unwrap();
-        assert_eq!(
-            OutputMode::from_flags(cli.raw, cli.pretty),
-            OutputMode::Human
-        );
+        assert!(matches!(
+            OutputMode::from_flags(cli.raw, cli.pretty, cli.no_color),
+            OutputMode::Human { color: false }
+        ));
 
         let cli = Cli::try_parse_from(["jujuleaf", "projects", "--raw"]).unwrap();
         assert_eq!(
-            OutputMode::from_flags(cli.raw, cli.pretty),
+            OutputMode::from_flags(cli.raw, cli.pretty, cli.no_color),
             OutputMode::RawJson
         );
         assert!(Cli::try_parse_from(["jujuleaf", "projects", "--raw", "--pretty"]).is_err());
+
+        let cli = Cli::try_parse_from(["jujuleaf", "projects", "--no-color"]).unwrap();
+        assert!(matches!(
+            OutputMode::from_flags(cli.raw, cli.pretty, cli.no_color),
+            OutputMode::Human { color: false }
+        ));
 
         let cli =
             Cli::try_parse_from(["jujuleaf", "read", "project", "main.tex", "--content-only"])
@@ -2061,6 +2162,141 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn parse_in_project(arguments: &[&str], current_dir: &Path) -> (Cli, Option<String>) {
+        let prepared = prepare_cli_args(
+            arguments.iter().map(OsString::from).collect::<Vec<_>>(),
+            current_dir,
+        )
+        .unwrap();
+        let profile = prepared.context_profile.clone();
+        (Cli::try_parse_from(prepared.arguments).unwrap(), profile)
+    }
+
+    #[test]
+    fn project_commands_infer_the_bound_project_from_parent_directories() {
+        let project = tempfile::tempdir().unwrap();
+        ProjectBinding {
+            project_id: "project-one".into(),
+            base_url: "https://example.test".into(),
+            profile: "work".into(),
+        }
+        .save(project.path())
+        .unwrap();
+        let nested = project.path().join("chapters/intro");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let (cli, profile) =
+            parse_in_project(&["jujuleaf", "read", "main.tex", "--content-only"], &nested);
+        assert_eq!(profile.as_deref(), Some("work"));
+        assert!(matches!(
+            cli.command,
+            Command::Read {
+                ref project_id,
+                ref path,
+                content_only: true,
+                ..
+            } if project_id == "project-one" && path == "main.tex"
+        ));
+
+        let (cli, _) = parse_in_project(
+            &["jujuleaf", "compile", "--timeout", "60", "--show-log"],
+            &nested,
+        );
+        assert!(matches!(
+            cli.command,
+            Command::Compile {
+                ref project_id,
+                timeout: 60,
+                show_log: true,
+                ..
+            } if project_id == "project-one"
+        ));
+
+        let (cli, _) = parse_in_project(&["jujuleaf", "search", "two", "words"], &nested);
+        assert!(matches!(
+            cli.command,
+            Command::Search {
+                ref project_id,
+                ref query,
+            } if project_id == "project-one" && query == &["two", "words"]
+        ));
+
+        let (cli, _) = parse_in_project(
+            &[
+                "jujuleaf",
+                "accept-changes",
+                "document-id",
+                "change-one",
+                "change-two",
+            ],
+            &nested,
+        );
+        assert!(matches!(
+            cli.command,
+            Command::AcceptChanges {
+                ref project_id,
+                ref doc_id,
+                ref change_ids,
+            } if project_id == "project-one"
+                && doc_id == "document-id"
+                && change_ids == &["change-one", "change-two"]
+        ));
+    }
+
+    #[test]
+    fn explicit_project_ids_remain_supported_and_can_override_context() {
+        let project = tempfile::tempdir().unwrap();
+        ProjectBinding {
+            project_id: "project-one".into(),
+            base_url: "https://example.test".into(),
+            profile: "work".into(),
+        }
+        .save(project.path())
+        .unwrap();
+
+        let (cli, profile) = parse_in_project(
+            &["jujuleaf", "read", "project-two", "main.tex"],
+            project.path(),
+        );
+        assert!(profile.is_none());
+        assert!(matches!(
+            cli.command,
+            Command::Read { ref project_id, .. } if project_id == "project-two"
+        ));
+
+        let (cli, profile) = parse_in_project(
+            &[
+                "jujuleaf",
+                "--project-id",
+                "project-two",
+                "search",
+                "two",
+                "words",
+            ],
+            project.path(),
+        );
+        assert!(profile.is_none());
+        assert_eq!(cli.project.as_deref(), Some("project-two"));
+        assert!(matches!(
+            cli.command,
+            Command::Search {
+                ref project_id,
+                ref query,
+            } if project_id == "project-two" && query == &["two", "words"]
+        ));
+    }
+
+    #[test]
+    fn missing_project_id_still_errors_outside_a_clone() {
+        let outside = tempfile::tempdir().unwrap();
+        let prepared = prepare_cli_args(
+            ["jujuleaf", "read", "main.tex"].map(OsString::from),
+            outside.path(),
+        )
+        .unwrap();
+        assert!(Cli::try_parse_from(prepared.arguments).is_err());
     }
 
     #[test]
@@ -2136,21 +2372,6 @@ mod tests {
     }
 
     #[test]
-    fn human_renderer_formats_project_lists_as_tables() {
-        let rendered = render_human(&json!({
-            "projects": [
-                {"_id": "p1", "accessLevel": "owner", "name": "Paper One"},
-                {"_id": "p2", "accessLevel": "readWrite", "name": "Paper Two"}
-            ]
-        }));
-        assert!(rendered.contains("PROJECTS (2)"));
-        assert!(rendered.contains("ID"));
-        assert!(rendered.contains("ACCESS LEVEL"));
-        assert!(rendered.contains("Paper One"));
-        assert!(!rendered.contains('{'));
-    }
-
-    #[test]
     fn local_sync_uses_the_bound_profile_unless_explicitly_overridden() {
         let project = tempfile::tempdir().unwrap();
         ProjectBinding {
@@ -2167,12 +2388,16 @@ mod tests {
         };
 
         assert_eq!(
-            selected_profile(&profiles, None, &command).unwrap(),
+            selected_profile(&profiles, None, None, &command).unwrap(),
             "company"
         );
         assert_eq!(
-            selected_profile(&profiles, Some("official"), &command).unwrap(),
+            selected_profile(&profiles, Some("official"), None, &command).unwrap(),
             "official"
+        );
+        assert_eq!(
+            selected_profile(&profiles, None, Some("company"), &Command::Projects).unwrap(),
+            "company"
         );
     }
 }

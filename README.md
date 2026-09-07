@@ -6,8 +6,8 @@ JujuLeaf is a Rust CLI that translates precise editor changes into Overleaf's
 real-time OT protocol and stores local project versions in a native Jujutsu
 workspace. It is designed for both humans and coding agents: commands are
 predictable, mutations are checked against their expected source text, and
-normal output is designed for humans. Use `--raw` for compact JSON or `--pretty`
-for indented JSON when scripting.
+normal output is styled for humans. Use `--raw` for compact, ANSI-free JSON or
+`--pretty` for indented, ANSI-free JSON when scripting.
 
 > JujuLeaf uses private Overleaf web and real-time APIs. Those APIs may change.
 > Keep a project backup while this project is pre-1.0.
@@ -67,14 +67,21 @@ cargo test --all-targets
 
 ## Output formats
 
-Commands are human-readable by default. Add `--raw` for compact JSON suitable
-for `jq` and automation, or `--pretty` for indented JSON:
+Commands are human-readable by default, with semantic status markers, aligned
+tables, and color when stdout is a terminal. Color is automatically disabled
+when output is redirected. Add `--no-color` (or set `NO_COLOR`) to disable ANSI
+styles explicitly. `--raw` emits compact JSON and `--pretty` emits indented
+JSON; neither JSON mode adds color:
 
 ```sh
 jujuleaf projects
 jujuleaf projects --raw | jq '.projects[].name'
 jujuleaf projects --pretty
+jujuleaf projects --no-color
 ```
+
+Agents and automation should use `--raw` and parse JSON rather than the
+human-readable view.
 
 `read --content-only` prints just the source text, without a table, label, or
 JSON wrapper:
@@ -217,10 +224,29 @@ cd paper
 jujuleaf status
 ```
 
-The selected profile name and endpoint are recorded in
-`.jj/jujuleaf/project.json`. Later `pull`, `push`, and `sync` commands use that
-bound profile automatically, even if the globally active profile changes. An
-explicit, different `--profile` is rejected before synchronization.
+The non-sensitive project ID is recorded in `.jujuleaf/project.json`; the
+selected profile name and endpoint remain private in
+`.jj/jujuleaf/project.json`. From the clone or any child directory, remote
+commands can therefore omit `PROJECT_ID`:
+
+```sh
+jujuleaf files
+jujuleaf read main.tex --content-only
+jujuleaf replace main.tex --old 'before' --new 'after'
+jujuleaf compile
+```
+
+The original explicit positional form remains available outside a clone. From
+inside a clone, use the global override before the command when intentionally
+targeting another project, especially for commands with trailing text:
+
+```sh
+jujuleaf --project-id OTHER_PROJECT_ID search 'exact phrase'
+```
+
+Later `pull`, `push`, and `sync` commands use the bound profile automatically,
+even if the globally active profile changes. An explicit, different `--profile`
+is rejected before synchronization.
 
 Remote comment threads, document ranges, and history-OT metadata (including
 tracked changes) are captured in `.jujuleaf/remote-metadata.json`. This file is

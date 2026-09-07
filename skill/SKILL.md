@@ -55,13 +55,14 @@ bound at clone time; do not override it with a different profile.
 
 ## Choose output for the consumer
 
-Use `--raw` for compact JSON that the agent will parse. Use `--pretty` for
-JSON shown to a human. Never combine them. Use `read --content-only` when only
+Use `--raw` for compact, ANSI-free JSON that the agent will parse.
+Use `--pretty` only when indented JSON materially helps a human.
+Never combine `--raw` and `--pretty`. Use `read --content-only` when only
 document text is required.
 
-Run `jujuleaf --help` or `jujuleaf COMMAND --help` before using an unfamiliar
-or destructive command. Do not parse human-readable tables when JSON is
-available.
+Run `jujuleaf --no-color --help` or `jujuleaf COMMAND --no-color --help`
+before using an unfamiliar or destructive command. Do not parse human-readable
+tables when JSON is available.
 
 ## Discover projects and documents
 
@@ -77,6 +78,23 @@ jujuleaf --profile NAME read PROJECT_ID main.tex --meta --raw
 Use the project ID returned by `projects`. Use paths returned by `files`;
 do not infer nested paths from display names.
 
+Inside a JujuLeaf clone or any child directory, omit `PROJECT_ID`. The CLI
+discovers the nearest `.jujuleaf/project.json` or compatible clone binding and
+uses its project and profile automatically:
+
+```bash
+jujuleaf files --raw
+jujuleaf read main.tex --content-only
+jujuleaf locate main.tex --text 'exact source text' --raw
+jujuleaf compile --raw
+```
+
+The `PROJECT_ID` placeholders below are for calls outside a clone. Remove that
+argument when operating on the current clone. To target a different project
+from inside a clone, put `--project-id OTHER_PROJECT_ID` before the command;
+use this explicit override for commands with trailing text such as `search`,
+`comment`, and `add-comment`.
+
 ## Make a precise remote edit
 
 Read the current content, locate the exact source, preview the operation, apply
@@ -86,7 +104,7 @@ it, then read the document again:
 jujuleaf read PROJECT_ID main.tex --content-only
 jujuleaf locate PROJECT_ID main.tex --text 'exact source text' --raw
 jujuleaf replace PROJECT_ID main.tex \
-  --old 'exact source text' --new 'replacement text' --dry-run --pretty
+  --old 'exact source text' --new 'replacement text' --dry-run --raw
 jujuleaf replace PROJECT_ID main.tex \
   --old 'exact source text' --new 'replacement text' --raw
 jujuleaf read PROJECT_ID main.tex --content-only
@@ -230,7 +248,7 @@ Use these commands deliberately:
 - Run `sync --watch` only for a foreground direct-sync loop. Expect it to stop
   on a conflict or Ctrl+C.
 
-Do not hand-edit `.jj/jujuleaf/` state or
+Do not hand-edit `.jj/jujuleaf/` state, `.jujuleaf/project.json`, or
 `.jujuleaf/remote-metadata.json`. Do not upload those private/audit paths.
 Publish local deletions and structural changes only through the explicit
 `delete-*`, `create-*`, `rename`, and `move` commands. Local file deletion

@@ -40,6 +40,11 @@ OT 适配层
     └── jj-lib：内容版本、操作历史、undo/redo
 ```
 
+人类可读输出由统一渲染层添加状态标记、对齐表格和语义色彩；只有输出到终端时才
+自动启用 ANSI。`--no-color` 和 `NO_COLOR` 会强制关闭色彩，`--raw`/`--pretty`
+始终输出不带 ANSI 的 JSON。因此人类显示格式可以继续演进，而 agent 和脚本只
+依赖稳定的结构化数据。
+
 ## 3. 为什么 `--old` 不会误改多个位置
 
 `--old` 的默认语义不是“搜到就全改”，而是：
@@ -196,16 +201,28 @@ tracked changes）。SQLite 是同步判断用的权威 checkpoint；JSON 文件
     └── company.json
 ```
 
-直接远程命令按“显式 `--profile` → 当前 active profile”选择身份。clone 时会把
-Profile 名和 base URL 一起写入：
+clone 时会把非敏感的项目 ID 写入可版本化的上下文标记，同时把 Profile 名和
+base URL 留在私有运行状态：
 
 ```text
+<project>/.jujuleaf/project.json
 <project>/.jj/jujuleaf/project.json
 ```
 
-项目中的 pull/push/sync 按“显式 `--profile` → 项目绑定 Profile”选择身份，并且
-同时核对 Profile 名和 base URL。因此即使两个账号使用同一个 Overleaf 域名，也
-不会仅凭 URL 相同就把内容推给错误账号。
+对于要求项目 ID 的远程命令，CLI 从当前目录向父目录搜索项目绑定、公开上下文
+标记，并兼容旧克隆的 `.jujuleaf/remote-metadata.json`。找到上下文时会在解析前
+补入项目 ID，所以 `read main.tex`、`files`、`compile` 等用法在克隆任意子目录
+都有效。显式位置参数仍用于克隆外调用；在克隆内访问另一项目时使用全局
+`--project-id OTHER_ID`，避免带尾随文本的命令产生位置歧义。
+
+上下文推断的远程命令按“显式 `--profile` → 项目绑定 Profile → 当前 active
+profile”选择身份。项目中的 pull/push/sync 继续按“显式 `--profile` → 项目绑定
+Profile”选择身份，并且同时核对 Profile 名和 base URL。因此即使两个账号使用
+同一个 Overleaf 域名，也不会仅凭 URL 相同就把内容推给错误账号。
+
+`.jujuleaf/project.json` 只包含 schema version 和项目 ID，不包含 Cookie、端点或
+账号信息；它和其他 `.jujuleaf` 审计元数据一样不会作为普通项目文件上传到
+Overleaf。
 
 旧的单 Session 配置只迁移一次到 `default`；Profile 列表和详情输出不会包含
 Cookie。

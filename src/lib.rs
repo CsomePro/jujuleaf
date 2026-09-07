@@ -4,6 +4,7 @@ pub mod cli;
 pub mod compile;
 pub mod jj;
 pub mod operations;
+pub mod output;
 pub mod project;
 pub mod review;
 pub mod socket;
