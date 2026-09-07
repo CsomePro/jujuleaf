@@ -5,6 +5,7 @@ pub mod compile;
 pub mod jj;
 pub mod operations;
 pub mod project;
+pub mod review;
 pub mod socket;
 pub mod store;
 pub mod sync;

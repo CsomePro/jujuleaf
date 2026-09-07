@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
+use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Cursor, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -20,6 +20,36 @@ use crate::store::{AssetCheckpoint, SyncStore, bytes_hash, content_hash};
 
 const STATE_DIR: &str = ".jj/jujuleaf";
 const METADATA_FILE: &str = ".jujuleaf/remote-metadata.json";
+
+pub(crate) struct WorkspaceOperationLock {
+    _file: File,
+}
+
+impl WorkspaceOperationLock {
+    pub(crate) fn acquire(root: &Path, operation: &str) -> Result<Self> {
+        let state_dir = root.join(STATE_DIR);
+        std::fs::create_dir_all(&state_dir)
+            .with_context(|| format!("failed to create {}", state_dir.display()))?;
+        let path = state_dir.join("workspace.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(TryLockError::WouldBlock) => bail!(
+                "cannot run {operation}: another JujuLeaf operation is already running in {}",
+                root.display()
+            ),
+            Err(TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("failed to lock {}", path.display()))
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -251,7 +281,7 @@ fn is_binary_path(path: &str, content: &[u8]) -> bool {
         || std::str::from_utf8(content).is_err()
 }
 
-fn collect_workspace_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+pub(crate) fn collect_workspace_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
     fn walk(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
@@ -1282,5 +1312,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         assert!(local_path(temp.path(), "../outside").is_err());
         assert!(local_path(temp.path(), "/safe/file.png").is_ok());
+    }
+
+    #[test]
+    fn workspace_operation_lock_serializes_writers() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = WorkspaceOperationLock::acquire(temp.path(), "first").unwrap();
+        assert!(WorkspaceOperationLock::acquire(temp.path(), "second").is_err());
+        drop(first);
+        WorkspaceOperationLock::acquire(temp.path(), "third").unwrap();
     }
 }

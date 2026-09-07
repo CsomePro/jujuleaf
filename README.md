@@ -18,6 +18,8 @@ for indented JSON when scripting.
 - CodeMirror-compatible UTF-16 positions, including documents containing emoji.
 - Both current Overleaf OT formats: `sharejs-text-ot` and `history-ot`.
 - Tracked-change suggestions and anchored comments.
+- Described review batches that publish a local Jujutsu change as Overleaf
+  tracked changes and reconcile accepted/rejected results back into the clone.
 - Actual `otUpdateApplied` confirmation instead of treating an RPC queue ack as
   a successful edit.
 - Retry deduplication with Overleaf's `publicId`/`dupIfSource` mechanism.
@@ -226,10 +228,58 @@ part of the Jujutsu working copy, so metadata changes can be inspected and
 restored alongside source changes. Operational baselines and receipts remain
 private under `.jj/jujuleaf/sync.sqlite3`.
 
-Edit files with any editor, then checkpoint and synchronize:
+### Reviewable local changes
+
+Start each review batch from a synchronized baseline, then describe the new
+Jujutsu child before editing:
 
 ```sh
-jujuleaf checkpoint -m 'rewrite introduction'
+jujuleaf sync
+jujuleaf begin -m 'rewrite introduction'
+# Edit existing text documents.
+jujuleaf review diff
+jujuleaf review submit
+jujuleaf review status
+# Accept or reject every tracked change in Overleaf.
+jujuleaf review finish
+jujuleaf begin -m 'next change'
+```
+
+`review submit` translates the complete local diff into tracked OT operations.
+It records the frozen local proposal separately from the synchronized parent;
+it does not run the ordinary direct `push` path. `review status` reports
+pending owned/foreign changes, unsubmitted files, unresolved receipts, and
+`readyToFinish`. `review finish` only succeeds after all project tracked
+changes are resolved and submitted local files remain frozen, then takes the
+reviewed remote text as the final result.
+
+If a multi-document submission stops after at least one remote attempt,
+`review status` identifies the files that were not submitted. Resolve every
+tracked change already present in Overleaf, then run `review finish`; the
+unsubmitted local proposals are reported and replaced by the current remote
+text. If submission stopped before any remote attempt, `review abort` remains
+safe. A persisted `finishing` phase makes `review finish` retryable after a
+local write, pull, or metadata step fails.
+
+While a review is active, ordinary `pull`, `push`, `sync`, `undo`, and
+`redo` are blocked. Workspace-mutating commands also share an inter-process
+lock, so a running `sync --watch` cannot overlap `begin`, review reconciliation,
+or Jujutsu history changes. Use `review abort` to abandon work before any
+remote submission attempt; the synchronized parent is restored while the draft
+remains recoverable in Jujutsu operation history. New files and binary changes
+are intentionally not accepted inside a review batch.
+
+The standalone `suggest` command remains useful for one isolated remote
+suggestion. Because it writes Overleaf directly, it does not advance a local
+clone checkpoint; synchronize before the next `begin`.
+
+### Direct local changes
+
+For changes that intentionally bypass Overleaf review, edit with any editor,
+checkpoint, and synchronize:
+
+```sh
+jujuleaf checkpoint -m 'rewrite introduction directly'
 jujuleaf sync
 ```
 

@@ -263,14 +263,61 @@ ranges/tracked-change 元数据已经偏离本地 checkpoint，会先拒绝写�
 pull 发现双方都改了二进制时，把远端版本放到
 `.jj/jujuleaf/incoming-assets/<file-id>`，不覆盖工作副本。
 
-## 10. undo/redo 与分组
+
+## 10. Review 修改状态机
+
+本地可审阅工作采用“同步父版本 → 描述后的子 change → Overleaf tracked
+changes → 审阅后远端结果”的单向状态机：
+
+```text
+sync → begin → draft → review submit → submitting → submitted → finishing → done
+                  └ review abort（无远端尝试）       │             │
+                                      部分提交恢复 ──┘             │
+                                      review finish 可重试 ────────┘
+```
+
+`begin` 先要求正文、二进制、操作回执和已知远端元数据均为干净状态，再创建
+与同步父版本内容相同、但带 description 的 Jujutsu 子 change，并把基线写入
+`.jj/jujuleaf/review.json`。该文件包含每个文档的远端 version、可见内容 hash
+和 metadata hash；它属于私有运行状态，不进入 Overleaf 项目。
+
+`review diff` 和首次 `review submit` 都重新读取实时文档，并严格核对 version、
+正文 hash 和 comments/tracked-change metadata hash。任何并发变化都会在发送
+OT 前停止。提交时，本地各文件的提案 hash 被冻结，文本差异使用 tracked OT
+发送；显式 change ID 不存在时，以完整 tracked-change JSON 的稳定 hash 作为
+本地身份。操作仍经过 SQLite receipt 的 prepared/inflight/unknown/confirmed
+状态。
+
+`review status` 检查项目中的全部同步文档，而不只检查本次改过的文件。只有本次
+change 的修订和其他修订均已消失、提交后的本地文件未再修改、且没有不确定回执
+时，`readyToFinish` 才为 true。状态结果同时列出未提交文件和不确定回执数量。
+`review finish` 以审阅后的远端正文为最终结果：接受、拒绝及审阅者后续编辑都会
+被拉回当前 change，然后保留原 description 并清除 review 状态。提交时的提案
+仍可从 Jujutsu operation 历史恢复。
+
+多文档提交若在至少一次远端尝试后中止，状态保持为 `submitting`。用户先在
+Overleaf 处理已出现的全部 tracked changes；之后 `review finish` 会报告未提交
+文件、放弃这些文件的本地提案，并以当前远端正文收敛。若尚无任何远端尝试，
+`review abort` 仍可安全恢复同步父版本。进入本地写入前，`review finish` 先持久化
+`finishing` 阶段和每个文档的最终 hash；文件写入、pull 或 description 更新失败
+后可直接重试，不会把已拉回的审阅结果误判为新的本地修改。不确定回执在确认远端
+已无 tracked changes 后也会被收敛为终态。
+
+review 活动期间，普通 `pull/push/sync` 以及 `undo/redo` 被拒绝，避免同一
+批次绕过 tracked changes 直接发布。所有同步、review 和 Jujutsu 写操作还共享
+`.jj/jujuleaf/workspace.lock` 的非阻塞进程锁；`sync --watch` 在整个监控周期持锁，
+所以另一个进程不能在两个周期之间插入 `begin`。新增文件和二进制变更不进入此
+状态机，必须在 `begin` 前通过显式结构操作或普通同步处理。
+
+
+## 11. undo/redo 与分组
 
 CLI 不按每个键盘事件建历史。一个显式 checkpoint、pull 或 push 边界构成一个
 有意义的版本组。`undo` 会先捕获尚未 checkpoint 的工作副本，再通过 jj-lib
 恢复前一 operation 的 tree；`redo` 恢复 undo 前保存的 operation。整个过程不
 调用外部 `jj` 命令。
 
-## 11. 编译与前台监控
+## 12. 编译与前台监控
 
 `compile` 调用 Overleaf 的同步编译 HTTP 接口；这个请求在服务端等待 CLSI 返回，
 JujuLeaf 额外设置客户端超时，超时后调用 `/compile/stop`。完成后下载

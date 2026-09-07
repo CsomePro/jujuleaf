@@ -1,6 +1,6 @@
 ---
 name: jujuleaf
-description: Safely interact with Overleaf and self-hosted Overleaf projects through the `jujuleaf` CLI, including authentication profiles, project and file discovery, exact-text and UTF-16 OT editing, tracked changes, comments, compilation and PDF download, and local-first Jujutsu clone, pull, push, sync, undo, and redo workflows. Use when an agent needs to read, edit, review, compile, synchronize, or manage an Overleaf-hosted LaTeX paper, thesis, manuscript, bibliography, or project with JujuLeaf.
+description: Safely interact with Overleaf and self-hosted Overleaf projects through the `jujuleaf` CLI, including authentication profiles, exact-text and UTF-16 OT editing, tracked changes, comments, compilation, and Jujutsu-backed sync, begin, review, finish, abort, undo, and redo workflows. Use when an agent needs to read, edit, review, compile, synchronize, or manage an Overleaf-hosted LaTeX paper, thesis, manuscript, bibliography, or project with JujuLeaf.
 ---
 
 # JujuLeaf
@@ -120,7 +120,8 @@ Prefer a local clone for broad rewrites or coordinated multi-file changes.
 
 ## Submit reviewable changes and comments
 
-Create tracked changes instead of direct edits when review is expected:
+For one isolated remote edit outside a local review batch, create a tracked
+change instead of a direct edit:
 
 ```bash
 jujuleaf suggest PROJECT_ID main.tex \
@@ -140,17 +141,77 @@ Inspect thread and document IDs before replying, resolving, reopening, editing,
 or deleting comments. Do not resolve or delete collaborators' threads unless the
 user requests it.
 
-## Use the local-first workflow
+## Review 修改范式
 
-Use a clone for repeated work, large edits, multiple files, binary assets, or
-recoverable local history:
+Use this as the default local workflow whenever collaborators should review a
+coherent text change before it becomes the accepted synchronized baseline:
+
+```bash
+cd ./paper
+jujuleaf sync --raw
+jujuleaf begin -m 'Rewrite the introduction' --raw
+# Edit existing text documents with the available workspace tools.
+jujuleaf review diff --raw
+jujuleaf review submit --raw
+jujuleaf review status --raw
+# Reviewers accept or reject every tracked change in Overleaf.
+jujuleaf review finish --raw
+jujuleaf begin -m 'Start the next coherent change' --raw
+```
+
+Interpret the boundary as `synchronized parent -> described child work`.
+`begin` requires a clean synchronized baseline with no pending tracked
+changes, then creates a new described Jujutsu child. It is the work boundary;
+`checkpoint` only snapshots the current child and does not start another one.
+
+Apply these review rules:
+
+- Use `review diff` before submission. It verifies that every remote document
+  still has the version, visible content, comments, and tracked-change metadata
+  captured at `begin`.
+- Use `review submit` to publish the local diff as Overleaf tracked changes.
+  Do not use direct `push`, `sync`, or per-file `suggest` for that batch.
+- Treat submitted local files as frozen. `review status` reports owned pending
+  changes, foreign pending changes, unsubmitted files, unresolved receipts,
+  post-submit local edits, and `readyToFinish`.
+- Add review comments after `review submit`, then inspect or reply through the
+  thread commands. Comments are reconciled by `review finish`.
+- Run `review finish` only after every tracked change in the project is
+  accepted or rejected. It takes the reviewed remote text as final, pulls all
+  remote state, preserves the work description, and closes the review state.
+- If a multi-document submission stops after at least one remote attempt,
+  inspect the `unsubmittedFiles` from `review status`, resolve every tracked
+  change already present in Overleaf, and run `review finish`. Finishing reports
+  those files and replaces their unsubmitted local proposals with remote text.
+- Run `review abort` only before any remote submission attempt. It restores the
+  synchronized parent and keeps the discarded draft recoverable in Jujutsu
+  operation history. A stopped submission with no remote attempt can therefore
+  be aborted; after an attempt, resolve the remote review and finish it instead.
+- Retry `review finish` after an interruption. Its persisted `finishing` phase
+  accepts either the frozen proposal or the already-written reviewed result.
+- Do not add new files or change binary files inside this review workflow.
+  Perform explicit structural/binary operations before `sync` and `begin`.
+
+An active review blocks `pull`, `push`, `sync`, `undo`, and `redo`. Mutating
+workspace commands also share a process lock, including the full lifetime of
+`sync --watch`. This prevents a tracked review batch from being accidentally
+published as ordinary direct edits.
+
+Use `suggest` only for an isolated remote suggestion outside an active local
+review batch. It changes Overleaf directly and does not advance a clone's local
+synchronization checkpoint; run `pull` or `sync` before the next `begin`.
+
+## Use direct local synchronization deliberately
+
+Use a clone for direct edits, binary assets, or work that does not require
+Overleaf review:
 
 ```bash
 jujuleaf --profile NAME clone PROJECT_ID ./paper --raw
 cd ./paper
 jujuleaf status --raw
 # Edit normal project files with the available workspace tools.
-jujuleaf checkpoint -m 'Describe the coherent change' --raw
+jujuleaf checkpoint -m 'Describe the coherent direct change' --raw
 jujuleaf sync --raw
 jujuleaf status --raw
 ```
@@ -162,12 +223,12 @@ Use these commands deliberately:
 
 - Run `pull` to accept remote text, metadata, and binary updates without
   overwriting concurrent local changes.
-- Run `push` to publish local changes only after inspecting status.
-- Run `checkpoint` at coherent task boundaries.
-- Run `undo` and `redo` for JujuLeaf-managed local history; do not manipulate
-  the internal `.jj` repository directly.
-- Run `sync --watch` only when the user wants a foreground long-running sync
-  loop. Expect it to stop on a conflict or Ctrl+C.
+- Run `push` only for intentionally direct publication outside a review.
+- Run `checkpoint` to snapshot the current work, not to create a work boundary.
+- Run `undo` and `redo` for JujuLeaf-managed local history outside an active
+  review; do not manipulate the internal `.jj` repository directly.
+- Run `sync --watch` only for a foreground direct-sync loop. Expect it to stop
+  on a conflict or Ctrl+C.
 
 Do not hand-edit `.jj/jujuleaf/` state or
 `.jujuleaf/remote-metadata.json`. Do not upload those private/audit paths.
@@ -200,9 +261,18 @@ On a sync conflict:
 4. Merge intentionally into the working copy.
 5. Checkpoint the resolution, pull again, and only then sync or push.
 
-After a connection loss or uncertain write, do not manually repeat the raw edit.
-Run `pull`, `push`, or `sync` so JujuLeaf can reconcile its SQLite receipt
-against the expected remote content hash.
+If `review diff` detects remote drift while still in draft, run
+`review abort`, synchronize, and start a new `begin`. Once submission starts,
+never delete the review state or retry an edit with standalone `suggest`. Rerun
+`review submit` for its receipt-aware recovery. If a later document has drifted
+after an earlier document was attempted, inspect `review status`, resolve every
+tracked change already on the project, and run `review finish`; its
+`unsubmittedFiles` are intentionally replaced by remote text. If no remote
+attempt was made, `review abort` is safe.
+
+After a connection loss or uncertain write outside an active review, do not
+manually repeat the raw edit. Run `pull`, `push`, or `sync` so JujuLeaf can
+reconcile its SQLite receipt against the expected remote content hash.
 
 Report conflicts, authentication requirements, compile failures, and uncertain
 outcomes explicitly. Never describe an unconfirmed remote mutation as complete.

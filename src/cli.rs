@@ -21,10 +21,14 @@ use crate::operations::{
     visible_to_source_position,
 };
 use crate::project::{collect_documents, connect_project_with_api, find_document, root_folder_id};
+use crate::review::{
+    abort_review, begin_review, ensure_sync_allowed, finish_review_with_api, review_diff_with_api,
+    review_status_with_api, submit_review_with_api,
+};
 use crate::socket::UpdateOptions;
 use crate::sync::{
-    ProjectBinding, clone_project, discover_root, local_status, pull_project_with_api,
-    push_project_with_api,
+    ProjectBinding, WorkspaceOperationLock, clone_project, discover_root, local_status,
+    pull_project_with_api, push_project_with_api,
 };
 
 #[derive(Parser)]
@@ -462,6 +466,20 @@ enum Command {
         #[arg(long, default_value_t = 2_000)]
         interval: u64,
     },
+    /// Start a described local work change from a clean synchronized baseline.
+    Begin {
+        /// Description attached to the new Jujutsu work change.
+        #[arg(short, long)]
+        message: String,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Submit and reconcile one described work change through Overleaf review.
+    Review {
+        #[command(subcommand)]
+        command: ReviewCommand,
+    },
     /// Compare local files with the last confirmed remote checkpoint.
     Status {
         /// Local JujuLeaf clone or a path inside it.
@@ -489,6 +507,54 @@ enum Command {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    /// Preview the local text changes that would be submitted for review.
+    Diff {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Submit the active work change as Overleaf tracked changes.
+    Submit {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        #[command(flatten)]
+        retry: RetryArgs,
+    },
+    /// Inspect pending, foreign, and unsubmitted review changes.
+    Status {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Abandon an unsubmitted review draft and restore its synchronized parent.
+    Abort {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Reconcile a resolved complete or partial remote review and close it.
+    Finish {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+}
+
+impl ReviewCommand {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Diff { path }
+            | Self::Submit { path, .. }
+            | Self::Status { path }
+            | Self::Abort { path }
+            | Self::Finish { path } => path,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1015,10 +1081,11 @@ fn selected_profile(
     if let Some(explicit) = explicit {
         return profiles.resolve(Some(explicit));
     }
-    let path = match command {
+    let path: Option<&Path> = match command {
         Command::Pull { path } | Command::Push { path, .. } | Command::Sync { path, .. } => {
-            Some(path)
+            Some(path.as_path())
         }
+        Command::Review { command } => Some(command.path()),
         _ => None,
     };
     if let Some(path) = path {
@@ -1272,22 +1339,39 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+        Command::Begin { message, path } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "begin")?;
+            output(begin_review(&root, &message).await?, pretty)
+        }
+        Command::Review {
+            command: ReviewCommand::Abort { path },
+        } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "review abort")?;
+            output(abort_review(&root).await?, pretty)
+        }
         Command::Status { path } => {
             let root = discover_root(path)?;
             output(local_status(&root).await?, pretty)
         }
         Command::Checkpoint { message, path } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "checkpoint")?;
             let mut workspace = JjWorkspace::open(root).await?;
             output(workspace.checkpoint(&message).await?, pretty)
         }
         Command::Undo { path } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "undo")?;
+            ensure_sync_allowed(&root, "undo")?;
             let mut workspace = JjWorkspace::open(root).await?;
             output(workspace.undo().await?, pretty)
         }
         Command::Redo { path } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "redo")?;
+            ensure_sync_allowed(&root, "redo")?;
             let mut workspace = JjWorkspace::open(root).await?;
             output(workspace.redo().await?, pretty)
         }
@@ -1734,8 +1818,34 @@ async fn dispatch_authenticated(
             clone_project(api, &session, profile, &project_id, &destination).await?,
             pretty,
         ),
+        Command::Review { command } => {
+            let root = discover_root(command.path())?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "review")?;
+            match command {
+                ReviewCommand::Diff { .. } => output(
+                    review_diff_with_api(&root, &session, profile, api).await?,
+                    pretty,
+                ),
+                ReviewCommand::Submit { retry, .. } => output(
+                    submit_review_with_api(&root, &session, profile, api, &retry.options()?)
+                        .await?,
+                    pretty,
+                ),
+                ReviewCommand::Status { .. } => output(
+                    review_status_with_api(&root, &session, profile, api).await?,
+                    pretty,
+                ),
+                ReviewCommand::Abort { .. } => unreachable!(),
+                ReviewCommand::Finish { .. } => output(
+                    finish_review_with_api(&root, &session, profile, api).await?,
+                    pretty,
+                ),
+            }
+        }
         Command::Pull { path } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "pull")?;
+            ensure_sync_allowed(&root, "pull")?;
             output(
                 pull_project_with_api(&root, &session, api, profile).await?,
                 pretty,
@@ -1743,6 +1853,8 @@ async fn dispatch_authenticated(
         }
         Command::Push { path, retry } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "push")?;
+            ensure_sync_allowed(&root, "push")?;
             output(
                 push_project_with_api(&root, &session, api, profile, &retry.options()?).await?,
                 pretty,
@@ -1755,6 +1867,8 @@ async fn dispatch_authenticated(
             interval,
         } => {
             let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "sync")?;
+            ensure_sync_allowed(&root, "sync")?;
             ensure!(interval > 0, "--interval must be positive");
             let options = retry.options()?;
             let mut cycle = 1_u64;
@@ -1803,6 +1917,7 @@ async fn dispatch_authenticated(
         }
         Command::Login { .. }
         | Command::Profile { .. }
+        | Command::Begin { .. }
         | Command::Status { .. }
         | Command::Checkpoint { .. }
         | Command::Undo { .. }
@@ -1980,6 +2095,42 @@ mod tests {
                 watch: true,
                 interval: 750,
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn begin_and_review_workflow_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "begin",
+            "--message",
+            "rewrite introduction",
+            "paper",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Begin { message, path }
+                if message == "rewrite introduction" && path.as_path() == Path::new("paper")
+        ));
+
+        for subcommand in ["diff", "status", "finish", "abort"] {
+            Cli::try_parse_from(["jujuleaf", "review", subcommand, "paper"]).unwrap();
+        }
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "review",
+            "submit",
+            "paper",
+            "--retry-after",
+            "4",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Review {
+                command: ReviewCommand::Submit { .. }
             }
         ));
     }
