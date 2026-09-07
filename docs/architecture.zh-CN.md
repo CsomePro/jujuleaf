@@ -260,8 +260,12 @@ CDP 返回的 Cookie 还会按 base URL 主机过滤；AAI 身份提供方域名
 - local == remote：已经收敛；
 - local、remote 都偏离 base 且互不相同：冲突。
 
-冲突时工作副本不被覆盖，远端副本保存在
-`.jj/jujuleaf/incoming/<doc-id>`。用户完成合并并 checkpoint 后再同步。
+冲突时工作副本不被覆盖。正文和二进制的远端副本分别保存在
+`.jj/jujuleaf/incoming/` 与 `.jj/jujuleaf/incoming-assets/`，文件名使用实体 ID
+的十六进制编码，避免路径穿越或不同 ID 相互覆盖。`conflicts.json` 记录冲突类型、
+项目路径、base/remote hash、远端 version、元数据 hash、删除状态和远端副本
+位置。pull 和直接 push 发现的冲突都写入同一 manifest，因此进程退出后仍能通过
+`conflict list/show` 审阅。
 
 本地全文与远端可见正文比较时会生成字符级 diff，再转换成多个有序、不重叠的
 UTF-16 change。因此两个相距很远的小改动不会把中间正文编码成“删除后重插”，
@@ -278,7 +282,18 @@ ranges/tracked-change 元数据已经偏离本地 checkpoint，会先拒绝写�
 ```
 
 pull 发现双方都改了二进制时，把远端版本放到
-`.jj/jujuleaf/incoming-assets/<file-id>`，不覆盖工作副本。
+`.jj/jujuleaf/incoming-assets/`，不覆盖工作副本。
+
+`conflict resolve` 只接受互斥的三种策略：`--ours` 保留工作副本，`--theirs`
+使用已保存的远端状态，`--merged FILE` 使用显式提供的合并结果。命令会先验证
+manifest、远端副本 hash、项目绑定和未决回执，再修改工作副本；随后创建 Jujutsu
+checkpoint、把 SQLite 基线推进到冲突发生时已观察的远端状态，并删除对应冲突
+记录。该动作不会直接写入 Overleaf。下一次 push 仍会重新读取实时远端并核对
+version/hash，因此解决期间出现的第三方改动会形成新冲突，而不会被旧决策覆盖。
+
+对于远端已经删除的二进制，`--theirs` 会删除本地文件，`--ours` 则保留本地内容
+供后续显式重建。review 状态机不允许带着未解决冲突开始、提交或结束，避免冲突
+绕过 tracked changes 边界。
 
 
 ## 10. Review 修改状态机
@@ -327,12 +342,23 @@ review 活动期间，普通 `pull/push/sync` 以及 `undo/redo` 被拒绝，避
 状态机，必须在 `begin` 前通过显式结构操作或普通同步处理。
 
 
-## 11. undo/redo 与分组
+## 11. 本地历史、恢复与忽略规则
 
 CLI 不按每个键盘事件建历史。一个显式 checkpoint、pull 或 push 边界构成一个
 有意义的版本组。`undo` 会先捕获尚未 checkpoint 的工作副本，再通过 jj-lib
 恢复前一 operation 的 tree；`redo` 恢复 undo 前保存的 operation。整个过程不
 调用外部 `jj` 命令。
+
+`local log` 沿 Jujutsu operation 父链列出 checkpoint，`local show` 按 operation
+或 commit ID 前缀展示文件变更和 unified diff，`local diff` 先捕获当前工作副本
+再展示未 checkpoint 的变更。`local restore` 把指定 operation 的 tree 写成新的
+operation，而不是移动或删除历史指针，所以恢复动作本身可继续 undo，也能再次
+找到恢复之后的版本。默认隐藏 `.jujuleaf` 审计元数据，只有显式 `--internal`
+才会显示。
+
+clone 根目录的 `.jujuleafignore` 使用 gitignore 语法。规则同时作用于工作区新文件
+扫描和 Jujutsu 新文件跟踪，但不会取消跟踪已经同步的 Overleaf 实体。无论规则
+内容如何，`.jj`、`.git`、`.jujuleaf` 与 `.jujuleafignore` 都不会进入上传候选。
 
 ## 12. 编译与前台监控
 
@@ -344,3 +370,13 @@ diagnostics；完整日志可显示或保存到文件。
 `sync --watch` 是前台轮询器：每个周期严格串行执行 pull→push，周期之间等待，
 Ctrl+C 正常退出，遇到任何正文、元数据或二进制冲突立即停止。当前不派生后台
 进程、不安装 systemd 服务；后台 daemon 属于后续阶段。
+
+## 13. 诊断与认证状态
+
+`auth status` 只报告所选 profile 是否存在本地凭据及其时间和服务地址，不序列化
+Cookie。`auth logout` 删除所选 profile 和凭据。
+
+`doctor` 聚合检查配置目录、认证、Unix 凭据权限、Chrome/Chromium、认证后的服务
+端访问、项目绑定、Jujutsu workspace，以及未决操作回执与冲突；`--offline` 会把
+服务端访问标为 skipped。warning 不影响顶层 `success`，任意 error 会把它设为
+false，便于人类和 Agent 使用同一份结构化诊断结果。

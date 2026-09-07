@@ -2,18 +2,66 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, ensure};
+use futures_util::{AsyncReadExt, StreamExt};
+use jj_lib::backend::{MergedTreeValue, TreeValue};
 use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
-use jj_lib::gitignore::GitIgnoreFile;
-use jj_lib::matchers::EverythingMatcher;
+use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
+use jj_lib::operation::Operation;
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::settings::UserSettings;
+use jj_lib::store::Store;
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
 use serde::Serialize;
+use similar::TextDiff;
+
+use crate::ignore;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalHistoryEntry {
+    pub operation_id: String,
+    pub commit_id: String,
+    pub change_id: String,
+    pub description: String,
+    pub commit_description: String,
+    pub timestamp: String,
+    pub current: bool,
+    pub snapshot: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalHistorySummary {
+    pub current_operation_id: String,
+    pub entries: Vec<LocalHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileChange {
+    pub path: String,
+    pub change: String,
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalChangeSummary {
+    pub operation_id: String,
+    pub commit_id: String,
+    pub change_id: String,
+    pub description: String,
+    pub commit_description: String,
+    pub timestamp: String,
+    pub files: Vec<LocalFileChange>,
+    pub patch: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -131,11 +179,12 @@ impl JjWorkspace {
             .start_working_copy_mutation()
             .await
             .context("failed to lock Jujutsu working copy")?;
+        let base_ignores = ignore::load(&self.root)?;
         let snapshot_options = SnapshotOptions {
-            base_ignores: GitIgnoreFile::empty(),
+            base_ignores,
             progress: None,
             start_tracking_matcher: &EverythingMatcher,
-            force_tracking_matcher: &EverythingMatcher,
+            force_tracking_matcher: &NothingMatcher,
             max_new_file_size: 100 * 1024 * 1024,
         };
         let (tree, _) = locked_workspace
@@ -455,6 +504,255 @@ impl JjWorkspace {
         Ok(checkpoint)
     }
 
+    async fn operation_commit(
+        &self,
+        operation: &Operation,
+    ) -> Result<(Arc<ReadonlyRepo>, jj_lib::commit::Commit)> {
+        let repo = self
+            .repo
+            .loader()
+            .load_at(operation)
+            .await
+            .context("failed to load Jujutsu operation")?;
+        let commit_id = repo
+            .view()
+            .get_wc_commit_id(self.workspace.workspace_name())
+            .cloned()
+            .ok_or_else(|| anyhow!("operation has no working-copy commit"))?;
+        let commit = repo.store().get_commit_async(&commit_id).await?;
+        Ok((repo, commit))
+    }
+
+    async fn history_operations(&self, limit: Option<usize>) -> Result<Vec<Operation>> {
+        let mut operations = Vec::new();
+        let mut operation = self.repo.operation().clone();
+        loop {
+            if operation.parent_ids().is_empty() {
+                break;
+            }
+            operations.push(operation.clone());
+            if limit.is_some_and(|limit| operations.len() >= limit) {
+                break;
+            }
+            operation = operation
+                .parents()
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| anyhow!("broken Jujutsu operation history"))?;
+        }
+        Ok(operations)
+    }
+
+    async fn resolve_operation(&self, revision: &str) -> Result<Operation> {
+        if revision == "@" {
+            return Ok(self.repo.operation().clone());
+        }
+        ensure!(
+            revision.len() >= 4 && revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "local revision must be '@' or a hexadecimal ID prefix of at least 4 characters"
+        );
+        let mut matches = Vec::new();
+        for operation in self.history_operations(None).await? {
+            let (_, commit) = self.operation_commit(&operation).await?;
+            if operation.id().hex().starts_with(revision) || commit.id().hex().starts_with(revision)
+            {
+                matches.push(operation);
+            }
+        }
+        ensure!(!matches.is_empty(), "local revision not found: {revision}");
+        ensure!(
+            matches.len() == 1,
+            "ambiguous local revision '{revision}'; provide a longer ID"
+        );
+        Ok(matches.remove(0))
+    }
+
+    pub async fn history(&self, limit: usize) -> Result<LocalHistorySummary> {
+        ensure!(limit > 0, "--limit must be greater than zero");
+        ensure!(limit <= 1_000, "--limit cannot exceed 1000");
+        let current_operation_id = self.repo.op_id().hex();
+        let mut entries = Vec::new();
+        for operation in self.history_operations(Some(limit)).await? {
+            let (_, commit) = self.operation_commit(&operation).await?;
+            let timestamp = operation
+                .metadata()
+                .time
+                .end
+                .to_datetime()
+                .context("operation timestamp is out of range")?
+                .to_rfc3339();
+            entries.push(LocalHistoryEntry {
+                operation_id: operation.id().hex(),
+                commit_id: commit.id().hex(),
+                change_id: commit.change_id().hex(),
+                description: operation.metadata().description.clone(),
+                commit_description: commit.description().to_owned(),
+                timestamp,
+                current: operation.id().hex() == current_operation_id,
+                snapshot: operation.metadata().is_snapshot,
+            });
+        }
+        Ok(LocalHistorySummary {
+            current_operation_id,
+            entries,
+        })
+    }
+
+    async fn value_bytes(
+        store: &Arc<Store>,
+        path: &jj_lib::repo_path::RepoPath,
+        value: MergedTreeValue,
+    ) -> Result<(bool, Option<Vec<u8>>)> {
+        let value = value.into_resolved().map_err(|_| {
+            anyhow!(
+                "unresolved Jujutsu tree conflict at {}",
+                path.as_internal_file_string()
+            )
+        })?;
+        match value {
+            None => Ok((false, None)),
+            Some(TreeValue::File { id, .. }) => {
+                let mut reader = store.read_file(path, &id).await?;
+                let mut contents = Vec::new();
+                reader.read_to_end(&mut contents).await?;
+                Ok((true, Some(contents)))
+            }
+            Some(_) => Ok((true, None)),
+        }
+    }
+
+    async fn diff_trees(
+        &self,
+        before: &MergedTree,
+        after: &MergedTree,
+        include_internal: bool,
+    ) -> Result<(Vec<LocalFileChange>, String)> {
+        let matcher = EverythingMatcher;
+        let mut stream = before.diff_stream(after, &matcher);
+        let mut files = Vec::new();
+        let mut patch = String::new();
+        while let Some(entry) = stream.next().await {
+            let path = entry.path.as_internal_file_string().to_owned();
+            if !include_internal && (path == ".jujuleaf" || path.starts_with(".jujuleaf/")) {
+                continue;
+            }
+            let values = entry.values?;
+            let (before_present, before_bytes) =
+                Self::value_bytes(before.store(), &entry.path, values.before).await?;
+            let (after_present, after_bytes) =
+                Self::value_bytes(after.store(), &entry.path, values.after).await?;
+            let change = match (before_present, after_present) {
+                (false, true) => "added",
+                (true, false) => "deleted",
+                (true, true) => "modified",
+                (false, false) => continue,
+            }
+            .to_owned();
+            let before_text = before_bytes
+                .as_deref()
+                .map(std::str::from_utf8)
+                .transpose()
+                .ok()
+                .flatten();
+            let after_text = after_bytes
+                .as_deref()
+                .map(std::str::from_utf8)
+                .transpose()
+                .ok()
+                .flatten();
+            let binary = (before_bytes.is_some() && before_text.is_none())
+                || (after_bytes.is_some() && after_text.is_none())
+                || before_bytes.is_none() && before_present
+                || after_bytes.is_none() && after_present;
+            if !binary {
+                let old = before_text.unwrap_or_default();
+                let new = after_text.unwrap_or_default();
+                let rendered = TextDiff::from_lines(old, new)
+                    .unified_diff()
+                    .context_radius(3)
+                    .header(&format!("a/{path}"), &format!("b/{path}"))
+                    .to_string();
+                if !rendered.is_empty() {
+                    if !patch.is_empty() {
+                        patch.push('\n');
+                    }
+                    patch.push_str(&rendered);
+                }
+            }
+            files.push(LocalFileChange {
+                path,
+                change,
+                binary,
+            });
+        }
+        Ok((files, patch))
+    }
+
+    async fn operation_change(
+        &self,
+        operation: &Operation,
+        include_internal: bool,
+    ) -> Result<LocalChangeSummary> {
+        let (repo, commit) = self.operation_commit(operation).await?;
+        let before_tree = if let Some(parent) = operation.parents().await?.into_iter().next() {
+            match self.operation_commit(&parent).await {
+                Ok((_, parent_commit)) => parent_commit.tree(),
+                Err(_) => repo.store().empty_merged_tree(),
+            }
+        } else {
+            repo.store().empty_merged_tree()
+        };
+        let (files, patch) = self
+            .diff_trees(&before_tree, &commit.tree(), include_internal)
+            .await?;
+        let timestamp = operation
+            .metadata()
+            .time
+            .end
+            .to_datetime()
+            .context("operation timestamp is out of range")?
+            .to_rfc3339();
+        Ok(LocalChangeSummary {
+            operation_id: operation.id().hex(),
+            commit_id: commit.id().hex(),
+            change_id: commit.change_id().hex(),
+            description: operation.metadata().description.clone(),
+            commit_description: commit.description().to_owned(),
+            timestamp,
+            files,
+            patch,
+        })
+    }
+
+    pub async fn show(&self, revision: &str, include_internal: bool) -> Result<LocalChangeSummary> {
+        let operation = self.resolve_operation(revision).await?;
+        self.operation_change(&operation, include_internal).await
+    }
+
+    pub async fn working_diff(&mut self, include_internal: bool) -> Result<LocalChangeSummary> {
+        let checkpoint = self.checkpoint("inspect local diff").await?;
+        if checkpoint.changed {
+            self.show("@", include_internal).await
+        } else {
+            let mut summary = self.show("@", include_internal).await?;
+            summary.files.clear();
+            summary.patch.clear();
+            Ok(summary)
+        }
+    }
+
+    pub async fn restore(&mut self, revision: &str) -> Result<Checkpoint> {
+        let target = self.resolve_operation(revision).await?;
+        self.checkpoint("capture local state before restore")
+            .await?;
+        self.restore_operation(
+            &target,
+            &format!("jujuleaf restore {}", &target.id().hex()[..12]),
+        )
+        .await
+    }
+
     pub async fn undo(&mut self) -> Result<Checkpoint> {
         self.checkpoint("capture local state before undo").await?;
         let current_operation_id = self.repo.op_id().hex();
@@ -577,5 +875,48 @@ mod tests {
 
         let next = workspace.begin_change("next work").await.unwrap();
         assert_eq!(next.parent_commit_id, base.commit_id);
+    }
+
+    #[tokio::test]
+    async fn history_show_and_restore_follow_operation_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        let file = temp.path().join("main.tex");
+        std::fs::write(&file, "one\n").unwrap();
+        let first = workspace.checkpoint("one").await.unwrap();
+        std::fs::write(&file, "two\n").unwrap();
+        workspace.checkpoint("two").await.unwrap();
+
+        let history = workspace.history(10).await.unwrap();
+        assert!(history.entries.len() >= 2);
+        assert!(history.entries[0].description.contains("two"));
+        let shown = workspace.show("@", false).await.unwrap();
+        assert_eq!(shown.files[0].path, "main.tex");
+        assert!(shown.patch.contains("-one"));
+        assert!(shown.patch.contains("+two"));
+
+        let restored = workspace.restore(&first.operation_id).await.unwrap();
+        assert!(restored.changed);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_honors_jujuleafignore_for_new_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        std::fs::write(temp.path().join(ignore::IGNORE_FILE), "*.aux\n").unwrap();
+        std::fs::write(temp.path().join("main.tex"), "paper\n").unwrap();
+        std::fs::write(temp.path().join("paper.aux"), "generated\n").unwrap();
+        workspace.checkpoint("paper").await.unwrap();
+
+        let shown = workspace.show("@", true).await.unwrap();
+        assert!(shown.files.iter().any(|file| file.path == "main.tex"));
+        assert!(
+            shown
+                .files
+                .iter()
+                .any(|file| file.path == ignore::IGNORE_FILE)
+        );
+        assert!(!shown.files.iter().any(|file| file.path == "paper.aux"));
     }
 }

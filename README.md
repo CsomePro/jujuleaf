@@ -169,6 +169,9 @@ foreign or partially resolved changes before closing it.
 | Download the compiled PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | Compare local and remote state | <code>jujuleaf status</code> |
 | Pull, push, or synchronize | <code>jujuleaf pull</code>, <code>jujuleaf push</code>, <code>jujuleaf sync</code> |
+| Inspect and resolve conflicts | <code>jujuleaf conflict list</code>, <code>jujuleaf conflict show PATH</code>, <code>jujuleaf conflict resolve PATH</code> |
+| Inspect local history | <code>jujuleaf local log</code>, <code>jujuleaf local show REVISION</code>, <code>jujuleaf local diff</code> |
+| Check setup and authentication | <code>jujuleaf doctor</code>, <code>jujuleaf auth status</code> |
 | Restore local history | <code>jujuleaf undo</code>, <code>jujuleaf redo</code> |
 
 Run jujuleaf --help or jujuleaf COMMAND --help for the complete command list and
@@ -243,6 +246,74 @@ current Overleaf copy with the last confirmed checkpoint:
 Remote versions and content hashes are checked again before updates are sent and
 after confirmation. New files and destructive operations are handled
 explicitly; conflicting remote content is preserved for manual recovery.
+
+### Resolve synchronization conflicts
+
+Pull and push record unresolved conflicts without overwriting the working copy.
+Inspect both sides, merge if needed, and make the choice explicit:
+
+~~~bash
+jujuleaf conflict list
+jujuleaf conflict show main.tex
+jujuleaf conflict resolve main.tex --ours
+jujuleaf conflict resolve main.tex --theirs
+jujuleaf conflict resolve main.tex --merged /tmp/main.tex
+~~~
+
+`--ours` keeps the local file, `--theirs` accepts the preserved remote copy,
+and `--merged` installs a file you prepared. Resolution creates a recoverable
+Jujutsu checkpoint and advances the observed remote baseline; the next push
+still verifies the live remote state before writing.
+
+### Inspect and restore local history
+
+JujuLeaf exposes the embedded Jujutsu operation history directly:
+
+~~~bash
+jujuleaf local log
+jujuleaf local show OPERATION_ID
+jujuleaf local diff
+jujuleaf local restore OPERATION_ID
+~~~
+
+`local show` accepts an operation or commit ID prefix, or `@` for the current
+operation. `local restore` restores that tree as a new operation, so the restore
+itself can be undone and does not erase later history. JujuLeaf embeds jj-lib;
+installing or invoking the separate `jj` executable is not required. Projects
+that also use Git should rely on Jujutsu's own Git interoperability rather than
+a second Git implementation inside JujuLeaf.
+
+### Ignore local-only files
+
+Create `.jujuleafignore` at the clone root to prevent matching generated or
+private files from being discovered for upload or first tracked by Jujutsu. It
+uses gitignore syntax:
+
+~~~gitignore
+/build/
+*.aux
+*.log
+.env
+~~~
+
+The rule does not untrack a file that was already checkpointed or an Overleaf
+entity that is already synchronized.
+`.jj`, `.git`, `.jujuleaf`, and `.jujuleafignore` are always private and are
+never considered for upload.
+
+## Diagnostics and sign-out
+
+~~~bash
+jujuleaf auth status
+jujuleaf doctor
+jujuleaf doctor --offline
+jujuleaf auth logout
+~~~
+
+`doctor` checks the selected profile, credential permissions, browser,
+endpoint, project binding, Jujutsu workspace, and pending sync state. The
+offline form skips the network check. `auth status` never prints the cookie;
+`auth logout` removes the selected local profile and its credentials.
 
 ## Current limitations
 

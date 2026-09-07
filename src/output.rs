@@ -117,6 +117,19 @@ fn normalized_key(key: &str) -> String {
         .collect()
 }
 
+fn human_table_scalar(key: &str, value: &Value) -> String {
+    let text = human_scalar(value);
+    let key = normalized_key(key);
+    if matches!(key.as_str(), "operationid" | "commitid" | "changeid")
+        && text.len() > 12
+        && text.is_ascii()
+    {
+        format!("{}…", &text[..12])
+    } else {
+        text
+    }
+}
+
 fn key_contains(key: &str, needles: &[&str]) -> bool {
     let key = normalized_key(key);
     needles.iter().any(|needle| key.contains(needle))
@@ -169,13 +182,15 @@ fn scalar_tone(key: &str, value: &Value) -> Tone {
         )
     {
         Tone::Yellow
+    } else if text == "skipped" {
+        Tone::Dim
     } else if key_contains(key, &["operationid"]) || normalized_key(key).ends_with("commitid") {
         Tone::Magenta
     } else if normalized_key(key).ends_with("id") || key_contains(key, &["path", "file", "url"]) {
         Tone::Cyan
     } else if matches!(
         text.as_str(),
-        "success" | "confirmed" | "submitted" | "finishing" | "clean"
+        "ok" | "success" | "confirmed" | "submitted" | "finishing" | "clean"
     ) {
         Tone::Green
     } else if text == "draft" {
@@ -300,7 +315,12 @@ fn write_table(output: &mut String, rows: &[Value], indent: usize, color: bool) 
             let object = row.as_object().expect("table rows are objects");
             columns
                 .iter()
-                .map(|column| object.get(column).map(human_scalar).unwrap_or_default())
+                .map(|column| {
+                    object
+                        .get(column)
+                        .map(|value| human_table_scalar(column, value))
+                        .unwrap_or_default()
+                })
                 .collect()
         })
         .collect();
@@ -621,6 +641,26 @@ mod tests {
         assert!(rendered.contains("Paper One"));
         assert!(!rendered.contains("UNCHANGED"));
         assert!(!rendered.contains('{'));
+    }
+
+    #[test]
+    fn history_tables_abbreviate_jj_ids_without_touching_project_ids() {
+        let operation_id = "0123456789abcdef0123456789abcdef";
+        let rendered = render_human(
+            &json!({
+                "projectId": "project-identifier-must-remain-complete",
+                "entries": [{
+                    "operationId": operation_id,
+                    "commitId": "abcdef0123456789abcdef0123456789",
+                    "description": "checkpoint"
+                }]
+            }),
+            false,
+        );
+        assert!(rendered.contains("0123456789ab…"));
+        assert!(rendered.contains("abcdef012345…"));
+        assert!(!rendered.contains(operation_id));
+        assert!(rendered.contains("project-identifier-must-remain-complete"));
     }
 
     #[test]

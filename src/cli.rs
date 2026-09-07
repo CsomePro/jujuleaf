@@ -5,13 +5,16 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
-use clap::{Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
+use clap::{
+    ArgGroup, Args, ColorChoice, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum,
+};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
 use crate::api::OverleafApi;
 use crate::auth::{LoginPreset, ProfileStore, Session, SessionStore, interactive_login};
 use crate::compile::{build_compile_report, has_output};
+use crate::doctor;
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, TextSelector,
@@ -27,8 +30,9 @@ use crate::review::{
 };
 use crate::socket::UpdateOptions;
 use crate::sync::{
-    ProjectBinding, WorkspaceOperationLock, clone_project, discover_project_context, discover_root,
-    local_status, pull_project_with_api, push_project_with_api,
+    ConflictResolution, ProjectBinding, WorkspaceOperationLock, clone_project,
+    discover_project_context, discover_root, list_conflicts, local_status, pull_project_with_api,
+    push_project_with_api, resolve_conflict, show_conflict,
 };
 
 #[derive(Parser)]
@@ -261,7 +265,8 @@ fn prepare_cli_args(
     let Some(shape) = project_argument_shape(command) else {
         return Ok(PreparedCliArgs {
             arguments,
-            context_profile: None,
+            context_profile: discover_project_context(current_dir)?
+                .and_then(|context| context.profile),
         });
     };
     let positions = positional_indices(&arguments, command_index);
@@ -355,6 +360,20 @@ enum Command {
     Profile {
         #[command(subcommand)]
         command: ProfileCommand,
+    },
+    /// Inspect or remove stored authentication for a profile.
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Diagnose authentication, endpoint, browser, and local workspace health.
+    Doctor {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+        /// Skip the authenticated Overleaf endpoint check.
+        #[arg(long)]
+        offline: bool,
     },
     /// List Overleaf projects.
     #[command(visible_alias = "ls-projects")]
@@ -699,6 +718,16 @@ enum Command {
         #[arg(default_value = ".")]
         destination: PathBuf,
     },
+    /// Inspect and resolve saved synchronization conflicts.
+    Conflict {
+        #[command(subcommand)]
+        command: ConflictCommand,
+    },
+    /// Browse, compare, and restore JujuLeaf's local Jujutsu history.
+    Local {
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
     /// Pull remote documents without overwriting concurrent local edits.
     #[command(visible_alias = "fetch")]
     Pull {
@@ -818,6 +847,124 @@ impl ReviewCommand {
             | Self::Finish { path } => path,
         }
     }
+}
+
+#[derive(Subcommand)]
+enum AuthCommand {
+    /// Show whether a profile has locally stored credentials.
+    Status,
+    /// Remove the selected profile's stored credentials.
+    Logout,
+}
+
+#[derive(Subcommand)]
+enum ConflictCommand {
+    /// List unresolved document and binary conflicts.
+    List {
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show hashes and a local-to-remote patch for one conflict.
+    Show {
+        /// Conflicted project path.
+        conflict_path: String,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Resolve one conflict with local, remote, or explicitly merged content.
+    Resolve(ConflictResolveArgs),
+}
+
+impl ConflictCommand {
+    fn root_path(&self) -> &Path {
+        match self {
+            Self::List { path } | Self::Show { path, .. } => path,
+            Self::Resolve(args) => &args.path,
+        }
+    }
+}
+
+#[derive(Args)]
+#[command(group(
+    ArgGroup::new("resolution")
+        .required(true)
+        .multiple(false)
+        .args(["ours", "theirs", "merged"])
+))]
+struct ConflictResolveArgs {
+    /// Conflicted project path.
+    conflict_path: String,
+    /// Keep the local file and use the observed remote version as its new base.
+    #[arg(long)]
+    ours: bool,
+    /// Replace the local file with the observed remote version.
+    #[arg(long)]
+    theirs: bool,
+    /// Use this file as manually merged content.
+    #[arg(long, value_name = "FILE")]
+    merged: Option<PathBuf>,
+    /// Local JujuLeaf clone or a path inside it.
+    #[arg(long, default_value = ".")]
+    path: PathBuf,
+}
+
+impl ConflictResolveArgs {
+    fn resolution(&self) -> ConflictResolution {
+        if self.ours {
+            ConflictResolution::Ours
+        } else if self.theirs {
+            ConflictResolution::Theirs
+        } else {
+            ConflictResolution::Merged(
+                self.merged
+                    .clone()
+                    .expect("clap requires one conflict resolution"),
+            )
+        }
+    }
+}
+
+#[derive(Subcommand)]
+enum LocalCommand {
+    /// List recent local Jujutsu operations, newest first.
+    Log {
+        /// Maximum number of operations to show.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Show the files and patch recorded by a local operation.
+    Show {
+        /// Operation or commit ID prefix; '@' means current.
+        revision: String,
+        /// Include JujuLeaf's versioned audit metadata.
+        #[arg(long)]
+        internal: bool,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Snapshot and show uncheckpointed working-copy changes.
+    Diff {
+        /// Include JujuLeaf's versioned audit metadata.
+        #[arg(long)]
+        internal: bool,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Restore files from a previous operation as a new recoverable operation.
+    Restore {
+        /// Operation or commit ID prefix shown by local log.
+        revision: String,
+        /// Local JujuLeaf clone or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1415,6 +1562,104 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
+        Command::Auth { command } => {
+            let profiles = ProfileStore::from_default_path()?;
+            let profile =
+                profiles.resolve(explicit_profile.as_deref().or(context_profile.as_deref()))?;
+            match command {
+                AuthCommand::Status => {
+                    let session = profiles.session_store(&profile)?.load()?;
+                    match session {
+                        Some(session) if !session.cookie.is_empty() => output(
+                            json!({
+                                "authenticated": true,
+                                "profile": profile,
+                                "baseUrl": session.base_url,
+                                "preset": session.login_preset,
+                                "createdAtMs": session.created_at_ms,
+                                "updatedAtMs": session.updated_at_ms
+                            }),
+                            pretty,
+                        ),
+                        _ => output(
+                            json!({
+                                "authenticated": false,
+                                "profile": profile,
+                                "hint": format!("run: jujuleaf login --profile {profile}")
+                            }),
+                            pretty,
+                        ),
+                    }
+                }
+                AuthCommand::Logout => {
+                    profiles.delete(&profile)?;
+                    let remaining = profiles.list()?;
+                    output(
+                        json!({
+                            "success": true,
+                            "loggedOut": profile,
+                            "remainingProfiles": remaining
+                        }),
+                        pretty,
+                    )
+                }
+            }
+        }
+        Command::Doctor { path, offline } => {
+            let profiles = ProfileStore::from_default_path()?;
+            output(
+                doctor::inspect(&profiles, explicit_profile.as_deref(), &path, !offline).await?,
+                pretty,
+            )
+        }
+        Command::Conflict { command } => {
+            let root = discover_root(command.root_path())?;
+            match command {
+                ConflictCommand::List { .. } => output(list_conflicts(&root)?, pretty),
+                ConflictCommand::Show { conflict_path, .. } => {
+                    output(show_conflict(&root, &conflict_path)?, pretty)
+                }
+                ConflictCommand::Resolve(args) => {
+                    let _lock = WorkspaceOperationLock::acquire(&root, "conflict resolve")?;
+                    ensure_sync_allowed(&root, "conflict resolve")?;
+                    output(
+                        resolve_conflict(&root, &args.conflict_path, args.resolution()).await?,
+                        pretty,
+                    )
+                }
+            }
+        }
+        Command::Local { command } => match command {
+            LocalCommand::Log { limit, path } => {
+                let root = discover_root(path)?;
+                let _lock = WorkspaceOperationLock::acquire(&root, "local log")?;
+                let workspace = JjWorkspace::open(root).await?;
+                output(workspace.history(limit).await?, pretty)
+            }
+            LocalCommand::Show {
+                revision,
+                internal,
+                path,
+            } => {
+                let root = discover_root(path)?;
+                let _lock = WorkspaceOperationLock::acquire(&root, "local show")?;
+                let workspace = JjWorkspace::open(root).await?;
+                output(workspace.show(&revision, internal).await?, pretty)
+            }
+            LocalCommand::Diff { internal, path } => {
+                let root = discover_root(path)?;
+                let _lock = WorkspaceOperationLock::acquire(&root, "local diff")?;
+                let mut workspace = JjWorkspace::open(root).await?;
+                output(workspace.working_diff(internal).await?, pretty)
+            }
+            LocalCommand::Restore { revision, path } => {
+                let root = discover_root(path)?;
+                let _lock = WorkspaceOperationLock::acquire(&root, "local restore")?;
+                ensure_sync_allowed(&root, "local restore")?;
+                let mut workspace = JjWorkspace::open(root).await?;
+                output(workspace.restore(&revision).await?, pretty)
+            }
+        },
         Command::Begin { message, path } => {
             let root = discover_root(path)?;
             let _lock = WorkspaceOperationLock::acquire(&root, "begin")?;
@@ -2001,6 +2246,10 @@ async fn dispatch_authenticated(
         }
         Command::Login { .. }
         | Command::Profile { .. }
+        | Command::Auth { .. }
+        | Command::Doctor { .. }
+        | Command::Conflict { .. }
+        | Command::Local { .. }
         | Command::Begin { .. }
         | Command::Status { .. }
         | Command::Checkpoint { .. }
@@ -2132,6 +2381,54 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_conflicts_and_local_history_commands_parse() {
+        let cli = Cli::try_parse_from(["jujuleaf", "auth", "status", "--profile", "work"]).unwrap();
+        assert_eq!(cli.profile.as_deref(), Some("work"));
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["jujuleaf", "doctor", "--offline", "./paper"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Doctor {
+                offline: true,
+                ref path
+            } if path == Path::new("./paper")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf", "conflict", "resolve", "main.tex", "--ours", "--raw",
+        ])
+        .unwrap();
+        assert!(cli.raw);
+        assert!(matches!(
+            cli.command,
+            Command::Conflict {
+                command: ConflictCommand::Resolve(ConflictResolveArgs { ours: true, .. })
+            }
+        ));
+        assert!(Cli::try_parse_from(["jujuleaf", "conflict", "resolve", "main.tex"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "jujuleaf", "conflict", "resolve", "main.tex", "--ours", "--theirs"
+            ])
+            .is_err()
+        );
+
+        let cli = Cli::try_parse_from(["jujuleaf", "local", "show", "@", "--internal"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local {
+                command: LocalCommand::Show { internal: true, .. }
+            }
+        ));
+    }
+
+    #[test]
     fn output_defaults_to_human_and_raw_is_machine_json() {
         let cli = Cli::try_parse_from(["jujuleaf", "projects"]).unwrap();
         assert!(matches!(
@@ -2186,6 +2483,15 @@ mod tests {
         .unwrap();
         let nested = project.path().join("chapters/intro");
         std::fs::create_dir_all(&nested).unwrap();
+
+        let (cli, profile) = parse_in_project(&["jujuleaf", "auth", "status"], &nested);
+        assert_eq!(profile.as_deref(), Some("work"));
+        assert!(matches!(
+            cli.command,
+            Command::Auth {
+                command: AuthCommand::Status
+            }
+        ));
 
         let (cli, profile) =
             parse_in_project(&["jujuleaf", "read", "main.tex", "--content-only"], &nested);

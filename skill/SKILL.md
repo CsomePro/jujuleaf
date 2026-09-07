@@ -35,6 +35,8 @@ Check the installed CLI without changing remote state:
 ```bash
 jujuleaf --version
 jujuleaf profile list --raw
+jujuleaf auth status --raw
+jujuleaf doctor --raw
 ```
 
 If `jujuleaf` is unavailable, tell the user to install the official prebuilt
@@ -54,6 +56,10 @@ jujuleaf login --profile company --base-url https://overleaf.example.org
 Use a named profile when multiple accounts or endpoints exist. Outside a clone,
 select it explicitly with `--profile NAME`. Inside a clone, keep the profile
 bound at clone time; do not override it with a different profile.
+
+Use `doctor --offline --raw` when a network check is inappropriate. `auth status`
+does not expose the cookie. Run `auth logout` only when the user explicitly asks
+to remove the selected local profile and its credentials.
 
 ## Choose output for the consumer
 
@@ -245,10 +251,19 @@ Use these commands deliberately:
   overwriting concurrent local changes.
 - Run `push` only for intentionally direct publication outside a review.
 - Run `checkpoint` to snapshot the current work, not to create a work boundary.
+- Run `local log`, `local show REVISION`, and `local diff` to inspect embedded
+  Jujutsu history. Prefer these read-only commands before a restoration.
+- Run `local restore REVISION` to restore a selected tree as a new recoverable
+  operation; do not assume it erases later history.
 - Run `undo` and `redo` for JujuLeaf-managed local history outside an active
   review; do not manipulate the internal `.jj` repository directly.
 - Run `sync --watch` only for a foreground direct-sync loop. Expect it to stop
   on a conflict or Ctrl+C.
+
+Put local generated or private paths in a root-level `.jujuleafignore`, using
+gitignore syntax. This affects discovery and checkpointing of new files; it does
+not untrack an already synchronized Overleaf entity. JujuLeaf always excludes
+`.jj`, `.git`, `.jujuleaf`, and `.jujuleafignore` from upload discovery.
 
 Do not hand-edit `.jj/jujuleaf/` state, `.jujuleaf/project.json`, or
 `.jujuleaf/remote-metadata.json`. Do not upload those private/audit paths.
@@ -275,11 +290,20 @@ log is useful for debugging.
 On a sync conflict:
 
 1. Stop further pushes.
-2. Run `jujuleaf status --raw`.
-3. Inspect the preserved remote copies under
-   `.jj/jujuleaf/incoming/` or `.jj/jujuleaf/incoming-assets/`.
-4. Merge intentionally into the working copy.
-5. Checkpoint the resolution, pull again, and only then sync or push.
+2. Run `jujuleaf conflict list --raw` and
+   `jujuleaf conflict show PATH --raw`.
+3. Compare the local file, preserved remote state, and returned patch. Do not
+   choose a side based only on the words "ours" or "theirs".
+4. Resolve exactly one path with an explicit choice:
+   - `jujuleaf conflict resolve PATH --ours --raw` keeps the working-copy file.
+   - `jujuleaf conflict resolve PATH --theirs --raw` accepts the preserved
+     remote state.
+   - `jujuleaf conflict resolve PATH --merged FILE --raw` uses a reviewed merge.
+5. Never choose `--ours` or `--theirs` without user intent unless the task
+   already states which version is authoritative. Prefer `--merged` when both
+   sides contain required work.
+6. Run `jujuleaf status --raw`, then `sync --raw` only after every conflict is
+   resolved. Resolution creates its own recoverable Jujutsu checkpoint.
 
 If `review diff` detects remote drift while still in draft, run
 `review abort`, synchronize, and start a new `begin`. Once submission starts,

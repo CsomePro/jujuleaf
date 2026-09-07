@@ -463,6 +463,20 @@ fn require_no_unresolved_receipts(status: &crate::sync::StatusSummary) -> Result
     Ok(())
 }
 
+fn require_no_sync_conflicts(status: &crate::sync::StatusSummary) -> Result<()> {
+    ensure!(
+        status.conflicts.is_empty(),
+        "resolve synchronization conflicts before review work: {}",
+        status
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.path.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(())
+}
+
 fn require_known_workspace_files(root: &Path, project_id: &str) -> Result<()> {
     let store = database(root)?;
     let known: BTreeSet<String> = store
@@ -496,6 +510,7 @@ pub async fn begin_review(root: &Path, description: &str) -> Result<BeginSummary
     let status = local_status(root).await?;
     require_clean_binary_state(root, &status)?;
     require_no_unresolved_receipts(&status)?;
+    require_no_sync_conflicts(&status)?;
     ensure!(
         status.modified.is_empty() && status.missing.is_empty(),
         "begin requires a clean synchronized text baseline; run sync before begin"
@@ -602,6 +617,7 @@ pub async fn review_diff_with_api(
     let status = local_status(root).await?;
     require_clean_binary_state(root, &status)?;
     require_no_unresolved_receipts(&status)?;
+    require_no_sync_conflicts(&status)?;
     require_known_workspace_files(root, &state.project_id)?;
 
     let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
@@ -684,6 +700,8 @@ pub async fn submit_review_with_api(
     let binding = validate_binding(root, session, profile, &state)?;
     let status = local_status(root).await?;
     require_clean_binary_state(root, &status)?;
+    require_no_unresolved_receipts(&status)?;
+    require_no_sync_conflicts(&status)?;
     require_known_workspace_files(root, &state.project_id)?;
 
     if state.phase == ReviewPhase::Draft {
@@ -1029,6 +1047,7 @@ pub async fn review_status_with_api(
     let binding = validate_binding(root, session, profile, &state)?;
     let status = local_status(root).await?;
     require_clean_binary_state(root, &status)?;
+    require_no_sync_conflicts(&status)?;
     require_known_workspace_files(root, &state.project_id)?;
     let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
     let documents = document_map(collect_entities(&project).documents);
@@ -1118,6 +1137,7 @@ pub async fn review_status_with_api(
         && pending.is_empty()
         && foreign.is_empty()
         && !local_changed
+        && status.conflicts.is_empty()
         && status.unresolved_receipts == 0;
     Ok(ReviewStatusSummary {
         success: true,

@@ -2,6 +2,8 @@ pub mod api;
 pub mod auth;
 pub mod cli;
 pub mod compile;
+pub mod doctor;
+pub mod ignore;
 pub mod jj;
 pub mod operations;
 pub mod output;

@@ -6,9 +6,11 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use similar::TextDiff;
 
 use crate::api::OverleafApi;
 use crate::auth::{DEFAULT_PROFILE, Session};
+use crate::ignore;
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, DocumentState, build_document_operations, minimal_text_changes,
@@ -19,6 +21,7 @@ use crate::socket::UpdateOptions;
 use crate::store::{AssetCheckpoint, SyncStore, bytes_hash, content_hash};
 
 const STATE_DIR: &str = ".jj/jujuleaf";
+const CONFLICTS_FILE: &str = ".jj/jujuleaf/conflicts.json";
 const METADATA_FILE: &str = ".jujuleaf/remote-metadata.json";
 const PROJECT_CONTEXT_FILE: &str = ".jujuleaf/project.json";
 
@@ -184,6 +187,101 @@ pub struct PushSummary {
     pub jj_operation_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictKind {
+    Document,
+    Asset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictRemoteState {
+    Present,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredConflict {
+    project_id: String,
+    kind: ConflictKind,
+    entity_id: String,
+    path: String,
+    remote_state: ConflictRemoteState,
+    #[serde(default)]
+    remote_version: Option<i64>,
+    #[serde(default)]
+    remote_hash: Option<String>,
+    #[serde(default)]
+    base_hash: Option<String>,
+    #[serde(default)]
+    parent_folder_id: Option<String>,
+    #[serde(default)]
+    metadata_hash: Option<String>,
+    #[serde(default)]
+    ranges_json: Option<String>,
+    #[serde(default)]
+    snapshot_metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConflictManifest {
+    schema_version: u32,
+    conflicts: Vec<StoredConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictSummary {
+    pub kind: ConflictKind,
+    pub path: String,
+    pub remote_state: ConflictRemoteState,
+    pub local_exists: bool,
+    pub incoming_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictListSummary {
+    pub project_id: String,
+    pub conflict_count: usize,
+    pub conflicts: Vec<ConflictSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictDetail {
+    pub project_id: String,
+    pub kind: ConflictKind,
+    pub path: String,
+    pub remote_state: ConflictRemoteState,
+    pub base_hash: Option<String>,
+    pub local_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub binary: bool,
+    pub diff: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictResolution {
+    Ours,
+    Theirs,
+    Merged(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConflictResolveSummary {
+    pub success: bool,
+    pub project_id: String,
+    pub path: String,
+    pub resolution: String,
+    pub remaining_conflicts: usize,
+    pub jj_operation_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StatusSummary {
@@ -196,12 +294,146 @@ pub struct StatusSummary {
     pub binary_missing: Vec<String>,
     pub binary_clean: Vec<String>,
     pub binary_untracked: Vec<String>,
+    pub ignored: Vec<String>,
+    pub conflicts: Vec<ConflictSummary>,
     pub unresolved_receipts: usize,
     pub jj_operation_id: String,
 }
 
 fn database(root: &Path) -> Result<SyncStore> {
     SyncStore::open(root.join(STATE_DIR).join("sync.sqlite3"))
+}
+
+fn conflict_manifest_path(root: &Path) -> PathBuf {
+    root.join(CONFLICTS_FILE)
+}
+
+fn load_conflict_manifest(root: &Path) -> Result<ConflictManifest> {
+    let path = conflict_manifest_path(root);
+    if !path.exists() {
+        return Ok(ConflictManifest {
+            schema_version: 1,
+            conflicts: Vec::new(),
+        });
+    }
+    let manifest: ConflictManifest = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?,
+    )
+    .with_context(|| format!("invalid {}", path.display()))?;
+    ensure!(
+        manifest.schema_version == 1,
+        "unsupported conflict manifest schema {}",
+        manifest.schema_version
+    );
+    Ok(manifest)
+}
+
+fn save_conflict_manifest(root: &Path, manifest: &ConflictManifest) -> Result<()> {
+    let path = conflict_manifest_path(root);
+    if manifest.conflicts.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)
+        .with_context(|| format!("failed to write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to replace {}", path.display()))
+}
+
+fn incoming_path(root: &Path, conflict: &StoredConflict) -> PathBuf {
+    let directory = match conflict.kind {
+        ConflictKind::Document => "incoming",
+        ConflictKind::Asset => "incoming-assets",
+    };
+    root.join(STATE_DIR)
+        .join(directory)
+        .join(hex::encode(conflict.entity_id.as_bytes()))
+}
+
+fn upsert_conflict(manifest: &mut ConflictManifest, conflict: StoredConflict) {
+    manifest.conflicts.retain(|existing| {
+        !(existing.kind == conflict.kind
+            && (existing.entity_id == conflict.entity_id || existing.path == conflict.path))
+    });
+    manifest.conflicts.push(conflict);
+    manifest
+        .conflicts
+        .sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn clear_conflict(
+    root: &Path,
+    manifest: &mut ConflictManifest,
+    kind: ConflictKind,
+    entity_id: &str,
+    path: &str,
+) {
+    let removed: Vec<_> = manifest
+        .conflicts
+        .iter()
+        .filter(|conflict| {
+            conflict.kind == kind && (conflict.entity_id == entity_id || conflict.path == path)
+        })
+        .cloned()
+        .collect();
+    manifest.conflicts.retain(|conflict| {
+        !(conflict.kind == kind && (conflict.entity_id == entity_id || conflict.path == path))
+    });
+    for conflict in removed {
+        std::fs::remove_file(incoming_path(root, &conflict)).ok();
+    }
+}
+
+fn record_conflict(
+    root: &Path,
+    manifest: &mut ConflictManifest,
+    conflict: StoredConflict,
+    incoming: Option<&[u8]>,
+) -> Result<()> {
+    clear_conflict(
+        root,
+        manifest,
+        conflict.kind,
+        &conflict.entity_id,
+        &conflict.path,
+    );
+    match conflict.remote_state {
+        ConflictRemoteState::Present => {
+            let incoming =
+                incoming.ok_or_else(|| anyhow!("present conflict has no incoming content"))?;
+            let path = incoming_path(root, &conflict);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, incoming)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+        }
+        ConflictRemoteState::Deleted => {}
+    }
+    upsert_conflict(manifest, conflict);
+    save_conflict_manifest(root, manifest)
+}
+
+fn find_conflict<'a>(manifest: &'a ConflictManifest, path: &str) -> Result<&'a StoredConflict> {
+    let path = path.trim_start_matches('/');
+    let matches: Vec<_> = manifest
+        .conflicts
+        .iter()
+        .filter(|conflict| conflict.path.trim_start_matches('/') == path)
+        .collect();
+    ensure!(!matches.is_empty(), "no unresolved conflict for {path}");
+    ensure!(
+        matches.len() == 1,
+        "multiple unresolved conflicts match {path}"
+    );
+    Ok(matches[0])
 }
 
 fn local_path(root: &Path, remote_path: &str) -> Result<PathBuf> {
@@ -309,31 +541,59 @@ fn is_binary_path(path: &str, content: &[u8]) -> bool {
         || std::str::from_utf8(content).is_err()
 }
 
-pub(crate) fn collect_workspace_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
-    fn walk(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) -> Result<()> {
+struct WorkspaceScan {
+    files: BTreeMap<String, Vec<u8>>,
+    ignored: Vec<String>,
+}
+
+fn scan_workspace_files(root: &Path) -> Result<WorkspaceScan> {
+    fn walk(
+        root: &Path,
+        directory: &Path,
+        rules: &jj_lib::gitignore::GitIgnoreFile,
+        files: &mut BTreeMap<String, Vec<u8>>,
+        ignored: &mut Vec<String>,
+    ) -> Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
             let relative = path.strip_prefix(root)?;
-            if relative.components().next().is_some_and(|component| {
-                component.as_os_str() == ".jj" || component.as_os_str() == ".jujuleaf"
-            }) {
+            if ignore::is_private_path(relative) {
                 continue;
             }
             let file_type = entry.file_type()?;
+            let repo_path = ignore::repo_path(relative)?;
             if file_type.is_dir() {
-                walk(root, &path, files)?;
+                if rules.matches_dir(&repo_path) {
+                    ignored.push(format!(
+                        "{}/",
+                        relative.to_string_lossy().replace('\\', "/")
+                    ));
+                } else {
+                    walk(root, &path, rules, files, ignored)?;
+                }
             } else if file_type.is_file() {
-                let remote = format!("/{}", relative.to_string_lossy().replace('\\', "/"));
-                files.insert(remote, std::fs::read(&path)?);
+                let normalized = relative.to_string_lossy().replace('\\', "/");
+                if rules.matches_file(&repo_path) {
+                    ignored.push(normalized);
+                } else {
+                    files.insert(format!("/{normalized}"), std::fs::read(&path)?);
+                }
             }
         }
         Ok(())
     }
 
+    let rules = ignore::load(root)?;
     let mut files = BTreeMap::new();
-    walk(root, root, &mut files)?;
-    Ok(files)
+    let mut ignored = Vec::new();
+    walk(root, root, &rules, &mut files, &mut ignored)?;
+    ignored.sort();
+    Ok(WorkspaceScan { files, ignored })
+}
+
+pub(crate) fn collect_workspace_files(root: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    Ok(scan_workspace_files(root)?.files)
 }
 
 pub fn discover_root(start: impl AsRef<Path>) -> Result<PathBuf> {
@@ -433,6 +693,276 @@ fn read_document(root: &Path, remote_path: &str) -> Result<Option<String>> {
     std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 document {}", path.display()))
         .map(Some)
+}
+
+fn conflict_summaries(root: &Path, manifest: &ConflictManifest) -> Result<Vec<ConflictSummary>> {
+    manifest
+        .conflicts
+        .iter()
+        .map(|conflict| {
+            Ok(ConflictSummary {
+                kind: conflict.kind,
+                path: conflict.path.clone(),
+                remote_state: conflict.remote_state,
+                local_exists: local_path(root, &conflict.path)?.exists(),
+                incoming_exists: incoming_path(root, conflict).exists(),
+            })
+        })
+        .collect()
+}
+
+pub fn list_conflicts(root: &Path) -> Result<ConflictListSummary> {
+    let binding = ProjectBinding::load(root)?;
+    let manifest = load_conflict_manifest(root)?;
+    let conflicts = conflict_summaries(root, &manifest)?;
+    Ok(ConflictListSummary {
+        project_id: binding.project_id,
+        conflict_count: conflicts.len(),
+        conflicts,
+    })
+}
+
+pub fn show_conflict(root: &Path, path: &str) -> Result<ConflictDetail> {
+    let binding = ProjectBinding::load(root)?;
+    let manifest = load_conflict_manifest(root)?;
+    let conflict = find_conflict(&manifest, path)?;
+    ensure!(
+        conflict.project_id == binding.project_id,
+        "conflict belongs to a different project"
+    );
+    let local = std::fs::read(local_path(root, &conflict.path)?).ok();
+    let remote =
+        match conflict.remote_state {
+            ConflictRemoteState::Present => {
+                let path = incoming_path(root, conflict);
+                Some(std::fs::read(&path).with_context(|| {
+                    format!("missing incoming conflict copy {}", path.display())
+                })?)
+            }
+            ConflictRemoteState::Deleted => None,
+        };
+    if let (Some(expected), Some(remote)) = (&conflict.remote_hash, &remote) {
+        ensure!(
+            bytes_hash(remote) == *expected,
+            "incoming conflict copy for {} was modified; run pull again",
+            conflict.path
+        );
+    }
+    let binary = conflict.kind == ConflictKind::Asset;
+    let diff = if binary {
+        String::new()
+    } else {
+        let local = local
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("local conflict document is not UTF-8")?
+            .unwrap_or_default();
+        let remote = remote
+            .as_deref()
+            .map(std::str::from_utf8)
+            .transpose()
+            .context("incoming conflict document is not UTF-8")?
+            .unwrap_or_default();
+        TextDiff::from_lines(local, remote)
+            .unified_diff()
+            .context_radius(3)
+            .header(
+                &format!("local/{}", conflict.path.trim_start_matches('/')),
+                &format!("remote/{}", conflict.path.trim_start_matches('/')),
+            )
+            .to_string()
+    };
+    Ok(ConflictDetail {
+        project_id: binding.project_id,
+        kind: conflict.kind,
+        path: conflict.path.clone(),
+        remote_state: conflict.remote_state,
+        base_hash: conflict.base_hash.clone(),
+        local_hash: local.as_deref().map(bytes_hash),
+        remote_hash: conflict.remote_hash.clone(),
+        binary,
+        diff,
+    })
+}
+
+pub async fn resolve_conflict(
+    root: &Path,
+    path: &str,
+    resolution: ConflictResolution,
+) -> Result<ConflictResolveSummary> {
+    let binding = ProjectBinding::load(root)?;
+    let mut manifest = load_conflict_manifest(root)?;
+    let conflict = find_conflict(&manifest, path)?.clone();
+    ensure!(
+        conflict.project_id == binding.project_id,
+        "conflict belongs to a different project"
+    );
+    let store = database(root)?;
+    ensure!(
+        store
+            .unresolved_operations(&binding.project_id, None)?
+            .is_empty(),
+        "resolve uncertain remote writes before resolving conflicts"
+    );
+    match (conflict.kind, conflict.remote_state) {
+        (ConflictKind::Document, ConflictRemoteState::Present) => {
+            ensure!(
+                conflict.remote_version.is_some()
+                    && conflict.remote_hash.is_some()
+                    && conflict.metadata_hash.is_some()
+                    && conflict.ranges_json.is_some()
+                    && conflict.snapshot_metadata_json.is_some(),
+                "document conflict metadata is incomplete; run pull again"
+            );
+        }
+        (ConflictKind::Document, ConflictRemoteState::Deleted) => {
+            bail!("deleted remote document conflicts are not supported")
+        }
+        (ConflictKind::Asset, ConflictRemoteState::Present) => {
+            ensure!(
+                conflict.remote_hash.is_some() && conflict.parent_folder_id.is_some(),
+                "asset conflict metadata is incomplete; run pull again"
+            );
+        }
+        (ConflictKind::Asset, ConflictRemoteState::Deleted) => {}
+    }
+    let incoming = match conflict.remote_state {
+        ConflictRemoteState::Present => {
+            let path = incoming_path(root, &conflict);
+            let contents = std::fs::read(&path)
+                .with_context(|| format!("missing incoming conflict copy {}", path.display()))?;
+            let expected = conflict
+                .remote_hash
+                .as_deref()
+                .ok_or_else(|| anyhow!("conflict has no remote hash"))?;
+            ensure!(
+                bytes_hash(&contents) == expected,
+                "incoming conflict copy for {} was modified; run pull again",
+                conflict.path
+            );
+            Some(contents)
+        }
+        ConflictRemoteState::Deleted => None,
+    };
+    let local = local_path(root, &conflict.path)?;
+    let (selected, resolution_name) = match &resolution {
+        ConflictResolution::Ours => {
+            (
+                Some(std::fs::read(&local).with_context(|| {
+                    format!("local conflict copy is missing: {}", local.display())
+                })?),
+                "ours",
+            )
+        }
+        ConflictResolution::Theirs => (incoming.clone(), "theirs"),
+        ConflictResolution::Merged(path) => (
+            Some(
+                std::fs::read(path)
+                    .with_context(|| format!("failed to read merged file {}", path.display()))?,
+            ),
+            "merged",
+        ),
+    };
+
+    match (&selected, conflict.kind) {
+        (Some(contents), ConflictKind::Document) => {
+            let contents =
+                std::str::from_utf8(contents).context("resolved document must be UTF-8")?;
+            write_document(root, &conflict.path, contents)?;
+        }
+        (Some(contents), ConflictKind::Asset) => {
+            write_binary(root, &conflict.path, contents)?;
+        }
+        (None, _) => {
+            if local.exists() {
+                std::fs::remove_file(&local)
+                    .with_context(|| format!("failed to remove {}", local.display()))?;
+            }
+        }
+    }
+
+    let mut workspace = JjWorkspace::open(root).await?;
+    let checkpoint = workspace
+        .checkpoint(&format!(
+            "resolve {} conflict using {resolution_name}",
+            conflict.path
+        ))
+        .await?;
+    match (conflict.kind, conflict.remote_state) {
+        (ConflictKind::Document, ConflictRemoteState::Present) => {
+            store.upsert_document(
+                &binding.project_id,
+                &conflict.entity_id,
+                &conflict.path,
+                conflict
+                    .remote_version
+                    .ok_or_else(|| anyhow!("document conflict has no remote version"))?,
+                conflict
+                    .remote_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("document conflict has no remote hash"))?,
+                Some(&checkpoint.operation_id),
+            )?;
+            store.upsert_document_metadata(
+                &binding.project_id,
+                &conflict.entity_id,
+                conflict.remote_version.unwrap(),
+                conflict
+                    .metadata_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("document conflict has no metadata hash"))?,
+                conflict
+                    .ranges_json
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("document conflict has no ranges"))?,
+                conflict
+                    .snapshot_metadata_json
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("document conflict has no snapshot metadata"))?,
+            )?;
+        }
+        (ConflictKind::Document, ConflictRemoteState::Deleted) => unreachable!(),
+        (ConflictKind::Asset, ConflictRemoteState::Present) => {
+            let remote = incoming
+                .as_deref()
+                .expect("present conflict has incoming data");
+            store.upsert_asset(AssetCheckpoint {
+                project_id: &binding.project_id,
+                file_id: &conflict.entity_id,
+                path: &conflict.path,
+                parent_folder_id: conflict
+                    .parent_folder_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("asset conflict has no parent folder"))?,
+                remote_hash: conflict
+                    .remote_hash
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("asset conflict has no remote hash"))?,
+                size: remote.len(),
+                jj_operation_id: Some(&checkpoint.operation_id),
+            })?;
+        }
+        (ConflictKind::Asset, ConflictRemoteState::Deleted) => {
+            store.remove_asset(&binding.project_id, &conflict.entity_id)?;
+        }
+    }
+    clear_conflict(
+        root,
+        &mut manifest,
+        conflict.kind,
+        &conflict.entity_id,
+        &conflict.path,
+    );
+    save_conflict_manifest(root, &manifest)?;
+    Ok(ConflictResolveSummary {
+        success: true,
+        project_id: binding.project_id,
+        path: conflict.path,
+        resolution: resolution_name.to_owned(),
+        remaining_conflicts: manifest.conflicts.len(),
+        jj_operation_id: checkpoint.operation_id,
+    })
 }
 
 fn extract_zip(bytes: &[u8], destination: &Path) -> Result<()> {
@@ -604,6 +1134,7 @@ pub async fn pull_project_with_api(
         session.base_url
     );
     let store = database(root)?;
+    let mut conflict_manifest = load_conflict_manifest(root)?;
     let mut workspace = JjWorkspace::open(root).await?;
     workspace.checkpoint("local state before pull").await?;
     let archive_entries = zip_entries(&api.download_zip(&binding.project_id).await?)?;
@@ -689,16 +1220,46 @@ pub async fn pull_project_with_api(
                 unchanged.push(document.path.clone());
             }
             "conflict" => {
-                let incoming = root.join(STATE_DIR).join("incoming").join(&document.id);
-                if let Some(parent) = incoming.parent() {
-                    std::fs::create_dir_all(parent)?;
+                if let Some(previous_path) = relocated_from.as_deref() {
+                    write_document(root, &document.path, local.as_deref().unwrap_or_default())?;
+                    std::fs::remove_file(local_path(root, previous_path)?).with_context(|| {
+                        format!("failed to remove relocated document {previous_path}")
+                    })?;
                 }
-                std::fs::write(incoming, &state.content)?;
+                let conflict = StoredConflict {
+                    project_id: binding.project_id.clone(),
+                    kind: ConflictKind::Document,
+                    entity_id: document.id.clone(),
+                    path: document.path.clone(),
+                    remote_state: ConflictRemoteState::Present,
+                    remote_version: Some(joined.version),
+                    remote_hash: Some(remote_hash.clone()),
+                    base_hash: previous
+                        .as_ref()
+                        .map(|previous| previous.remote_hash.clone()),
+                    parent_folder_id: None,
+                    metadata_hash: Some(metadata_hash.clone()),
+                    ranges_json: Some(ranges_json.clone()),
+                    snapshot_metadata_json: Some(snapshot_metadata_json.clone()),
+                };
+                record_conflict(
+                    root,
+                    &mut conflict_manifest,
+                    conflict,
+                    Some(state.content.as_bytes()),
+                )?;
                 conflicts.push(document.path.clone());
             }
             _ => unreachable!(),
         }
         if action != "conflict" {
+            clear_conflict(
+                root,
+                &mut conflict_manifest,
+                ConflictKind::Document,
+                &document.id,
+                &document.path,
+            );
             if let Some(previous_path) = relocated_from {
                 std::fs::remove_file(local_path(root, &previous_path)?)?;
             }
@@ -780,16 +1341,41 @@ pub async fn pull_project_with_api(
                 binary_unchanged.push(file.path.clone());
             }
             "conflict" => {
-                let incoming = root.join(STATE_DIR).join("incoming-assets").join(&file.id);
-                if let Some(parent) = incoming.parent() {
-                    std::fs::create_dir_all(parent)?;
+                if let Some(previous_path) = relocated_from.as_deref() {
+                    write_binary(root, &file.path, local.as_deref().unwrap_or_default())?;
+                    std::fs::remove_file(local_path(root, previous_path)?).with_context(|| {
+                        format!("failed to remove relocated asset {previous_path}")
+                    })?;
                 }
-                std::fs::write(incoming, remote)?;
+                let conflict = StoredConflict {
+                    project_id: binding.project_id.clone(),
+                    kind: ConflictKind::Asset,
+                    entity_id: file.id.clone(),
+                    path: file.path.clone(),
+                    remote_state: ConflictRemoteState::Present,
+                    remote_version: None,
+                    remote_hash: Some(remote_hash.clone()),
+                    base_hash: previous
+                        .as_ref()
+                        .map(|previous| previous.remote_hash.clone()),
+                    parent_folder_id: Some(file.parent_folder_id.clone()),
+                    metadata_hash: None,
+                    ranges_json: None,
+                    snapshot_metadata_json: None,
+                };
+                record_conflict(root, &mut conflict_manifest, conflict, Some(remote))?;
                 binary_conflicts.push(file.path.clone());
             }
             _ => unreachable!(),
         }
         if action != "conflict" {
+            clear_conflict(
+                root,
+                &mut conflict_manifest,
+                ConflictKind::Asset,
+                &file.id,
+                &file.path,
+            );
             if let Some(previous_path) = relocated_from {
                 std::fs::remove_file(local_path(root, &previous_path)?)?;
             }
@@ -803,16 +1389,46 @@ pub async fn pull_project_with_api(
         }
         match read_binary(root, &previous.path)? {
             Some(local) if bytes_hash(&local) != previous.remote_hash => {
-                binary_conflicts.push(previous.path);
+                let path = previous.path.clone();
+                let conflict = StoredConflict {
+                    project_id: binding.project_id.clone(),
+                    kind: ConflictKind::Asset,
+                    entity_id: previous.file_id.clone(),
+                    path: path.clone(),
+                    remote_state: ConflictRemoteState::Deleted,
+                    remote_version: None,
+                    remote_hash: None,
+                    base_hash: Some(previous.remote_hash.clone()),
+                    parent_folder_id: Some(previous.parent_folder_id.clone()),
+                    metadata_hash: None,
+                    ranges_json: None,
+                    snapshot_metadata_json: None,
+                };
+                record_conflict(root, &mut conflict_manifest, conflict, None)?;
+                binary_conflicts.push(path);
             }
             Some(_) => {
                 std::fs::remove_file(local_path(root, &previous.path)?)?;
                 binary_deleted.push(previous.path.clone());
                 store.remove_asset(&binding.project_id, &previous.file_id)?;
+                clear_conflict(
+                    root,
+                    &mut conflict_manifest,
+                    ConflictKind::Asset,
+                    &previous.file_id,
+                    &previous.path,
+                );
             }
             None => {
                 binary_deleted.push(previous.path.clone());
                 store.remove_asset(&binding.project_id, &previous.file_id)?;
+                clear_conflict(
+                    root,
+                    &mut conflict_manifest,
+                    ConflictKind::Asset,
+                    &previous.file_id,
+                    &previous.path,
+                );
             }
         }
     }
@@ -858,6 +1474,7 @@ pub async fn pull_project_with_api(
             jj_operation_id: Some(&checkpoint.operation_id),
         })?;
     }
+    save_conflict_manifest(root, &conflict_manifest)?;
     Ok(PullSummary {
         success: conflicts.is_empty() && binary_conflicts.is_empty(),
         project_id: binding.project_id,
@@ -907,6 +1524,7 @@ pub async fn push_project_with_api(
         session.base_url
     );
     let store = database(root)?;
+    let mut conflict_manifest = load_conflict_manifest(root)?;
     let mut workspace = JjWorkspace::open(root).await?;
     let checkpoint = workspace.checkpoint("local state before push").await?;
     let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
@@ -923,13 +1541,12 @@ pub async fn push_project_with_api(
     let mut metadata_documents = BTreeMap::new();
 
     for document in &entities.documents {
-        let Some(local) = read_document(root, &document.path)? else {
-            conflicts.push(document.path.clone());
-            continue;
-        };
+        let mut local = read_document(root, &document.path)?;
         let joined = socket.join_doc(&document.id).await?;
         let state = parse_document_snapshot(joined.snapshot, &joined.ot_type)?;
         let (snapshot_metadata, metadata_hash) = metadata_parts(&state, &joined.ranges)?;
+        let ranges_json = serde_json::to_string(&joined.ranges)?;
+        let snapshot_metadata_json = serde_json::to_string(&snapshot_metadata)?;
         metadata_documents.insert(
             document.id.clone(),
             DocumentMetadataSnapshot {
@@ -939,9 +1556,48 @@ pub async fn push_project_with_api(
                 snapshot_metadata: snapshot_metadata.clone(),
             },
         );
-        let local_hash = content_hash(&local);
         let remote_hash = content_hash(&state.content);
         store.reconcile_confirmed_hash(&binding.project_id, &document.id, &remote_hash)?;
+        let previous = store.document(&binding.project_id, &document.id)?;
+        if local.is_none()
+            && let Some(previous) = &previous
+            && previous.path != document.path
+            && let Some(previous_local) = read_document(root, &previous.path)?
+        {
+            write_document(root, &document.path, &previous_local)?;
+            std::fs::remove_file(local_path(root, &previous.path)?).with_context(|| {
+                format!("failed to remove relocated document {}", previous.path)
+            })?;
+            local = Some(previous_local);
+        }
+        let observed_conflict = StoredConflict {
+            project_id: binding.project_id.clone(),
+            kind: ConflictKind::Document,
+            entity_id: document.id.clone(),
+            path: document.path.clone(),
+            remote_state: ConflictRemoteState::Present,
+            remote_version: Some(joined.version),
+            remote_hash: Some(remote_hash.clone()),
+            base_hash: previous
+                .as_ref()
+                .map(|previous| previous.remote_hash.clone()),
+            parent_folder_id: None,
+            metadata_hash: Some(metadata_hash.clone()),
+            ranges_json: Some(ranges_json.clone()),
+            snapshot_metadata_json: Some(snapshot_metadata_json.clone()),
+        };
+        let Some(local) = local else {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(state.content.as_bytes()),
+            )?;
+            conflicts.push(document.path.clone());
+            socket.leave_doc(&document.id).await.ok();
+            continue;
+        };
+        let local_hash = content_hash(&local);
         if local_hash == remote_hash {
             store.upsert_document(
                 &binding.project_id,
@@ -956,30 +1612,61 @@ pub async fn push_project_with_api(
                 &document.id,
                 joined.version,
                 &metadata_hash,
-                &serde_json::to_string(&joined.ranges)?,
-                &serde_json::to_string(&snapshot_metadata)?,
+                &ranges_json,
+                &snapshot_metadata_json,
             )?;
+            clear_conflict(
+                root,
+                &mut conflict_manifest,
+                ConflictKind::Document,
+                &document.id,
+                &document.path,
+            );
             unchanged.push(document.path.clone());
             socket.leave_doc(&document.id).await.ok();
             continue;
         }
-        let Some(previous) = store.document(&binding.project_id, &document.id)? else {
+        let Some(previous) = previous else {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(state.content.as_bytes()),
+            )?;
             conflicts.push(document.path.clone());
             socket.leave_doc(&document.id).await.ok();
             continue;
         };
         if remote_hash != previous.remote_hash {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(state.content.as_bytes()),
+            )?;
             conflicts.push(document.path.clone());
             socket.leave_doc(&document.id).await.ok();
             continue;
         }
         let Some(previous_metadata) = store.document_metadata(&binding.project_id, &document.id)?
         else {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(state.content.as_bytes()),
+            )?;
             metadata_conflicts.push(document.path.clone());
             socket.leave_doc(&document.id).await.ok();
             continue;
         };
         if previous_metadata.metadata_hash != metadata_hash {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(state.content.as_bytes()),
+            )?;
             metadata_conflicts.push(document.path.clone());
             socket.leave_doc(&document.id).await.ok();
             continue;
@@ -1037,6 +1724,13 @@ pub async fn push_project_with_api(
                             snapshot_metadata: refreshed_snapshot_metadata,
                         },
                     );
+                    clear_conflict(
+                        root,
+                        &mut conflict_manifest,
+                        ConflictKind::Document,
+                        &document.id,
+                        &document.path,
+                    );
                     pushed.push(document.path.clone());
                 } else {
                     unknown.push(document.path.clone());
@@ -1081,6 +1775,13 @@ pub async fn push_project_with_api(
                             snapshot_metadata: refreshed_snapshot_metadata,
                         },
                     );
+                    clear_conflict(
+                        root,
+                        &mut conflict_manifest,
+                        ConflictKind::Document,
+                        &document.id,
+                        &document.path,
+                    );
                     pushed.push(document.path.clone());
                 } else {
                     unknown.push(document.path.clone());
@@ -1101,21 +1802,74 @@ pub async fn push_project_with_api(
     for file in &entities.files {
         let remote = api.download_file(&binding.project_id, &file.id).await?;
         let remote_hash = bytes_hash(&remote);
-        let Some(local) = read_binary(root, &file.path)? else {
+        let previous = store.asset(&binding.project_id, &file.id)?;
+        let mut local = read_binary(root, &file.path)?;
+        if local.is_none()
+            && let Some(previous) = &previous
+            && previous.path != file.path
+            && let Some(previous_local) = read_binary(root, &previous.path)?
+        {
+            write_binary(root, &file.path, &previous_local)?;
+            std::fs::remove_file(local_path(root, &previous.path)?)
+                .with_context(|| format!("failed to remove relocated asset {}", previous.path))?;
+            local = Some(previous_local);
+        }
+        let observed_conflict = StoredConflict {
+            project_id: binding.project_id.clone(),
+            kind: ConflictKind::Asset,
+            entity_id: file.id.clone(),
+            path: file.path.clone(),
+            remote_state: ConflictRemoteState::Present,
+            remote_version: None,
+            remote_hash: Some(remote_hash.clone()),
+            base_hash: previous
+                .as_ref()
+                .map(|previous| previous.remote_hash.clone()),
+            parent_folder_id: Some(file.parent_folder_id.clone()),
+            metadata_hash: None,
+            ranges_json: None,
+            snapshot_metadata_json: None,
+        };
+        let Some(local) = local else {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(&remote),
+            )?;
             binary_conflicts.push(file.path.clone());
             continue;
         };
         let local_hash = bytes_hash(&local);
         if local_hash == remote_hash {
+            clear_conflict(
+                root,
+                &mut conflict_manifest,
+                ConflictKind::Asset,
+                &file.id,
+                &file.path,
+            );
             accepted_assets.push((file.clone(), remote_hash, local.len()));
             binary_unchanged.push(file.path.clone());
             continue;
         }
-        let Some(previous) = store.asset(&binding.project_id, &file.id)? else {
+        let Some(previous) = previous else {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(&remote),
+            )?;
             binary_conflicts.push(file.path.clone());
             continue;
         };
         if previous.remote_hash != remote_hash {
+            record_conflict(
+                root,
+                &mut conflict_manifest,
+                observed_conflict,
+                Some(&remote),
+            )?;
             binary_conflicts.push(file.path.clone());
             continue;
         }
@@ -1146,6 +1900,13 @@ pub async fn push_project_with_api(
                     local_hash,
                     local.len(),
                 ));
+                clear_conflict(
+                    root,
+                    &mut conflict_manifest,
+                    ConflictKind::Asset,
+                    &file.id,
+                    &file.path,
+                );
                 binary_pushed.push(file.path.clone());
             }
             Err(_) => binary_unknown.push(file.path.clone()),
@@ -1236,6 +1997,7 @@ pub async fn push_project_with_api(
             jj_operation_id: Some(&final_checkpoint.operation_id),
         })?;
     }
+    save_conflict_manifest(root, &conflict_manifest)?;
     Ok(PushSummary {
         success: conflicts.is_empty()
             && unknown.is_empty()
@@ -1296,7 +2058,8 @@ pub async fn local_status(root: &Path) -> Result<StatusSummary> {
             Some(_) => binary_modified.push(asset.path),
         }
     }
-    for (path, content) in collect_workspace_files(root)? {
+    let scan = scan_workspace_files(root)?;
+    for (path, content) in scan.files {
         if !document_paths.contains(path.as_str())
             && !asset_paths.contains(path.as_str())
             && is_binary_path(&path, &content)
@@ -1304,6 +2067,8 @@ pub async fn local_status(root: &Path) -> Result<StatusSummary> {
             binary_untracked.push(path);
         }
     }
+    let conflict_manifest = load_conflict_manifest(root)?;
+    let conflicts = conflict_summaries(root, &conflict_manifest)?;
     Ok(StatusSummary {
         project_id: binding.project_id,
         profile: binding.profile,
@@ -1314,6 +2079,8 @@ pub async fn local_status(root: &Path) -> Result<StatusSummary> {
         binary_missing,
         binary_clean,
         binary_untracked,
+        ignored: scan.ignored,
+        conflicts,
         unresolved_receipts: unresolved.len(),
         jj_operation_id,
     })
@@ -1466,6 +2233,154 @@ mod tests {
             "/figures/plot.png",
             files.values().next().unwrap()
         ));
+    }
+
+    #[test]
+    fn workspace_scan_honors_jujuleafignore() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("build")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(ignore::IGNORE_FILE), "/build/\n*.aux\n").unwrap();
+        std::fs::write(temp.path().join("build/output.pdf"), [0, 1]).unwrap();
+        std::fs::write(temp.path().join("paper.aux"), b"generated").unwrap();
+        std::fs::write(temp.path().join("figure.png"), [0, 1, 2]).unwrap();
+        std::fs::write(temp.path().join(".git/index"), [0, 1, 2]).unwrap();
+
+        let scan = scan_workspace_files(temp.path()).unwrap();
+        assert_eq!(
+            scan.files.keys().cloned().collect::<Vec<_>>(),
+            vec!["/figure.png"]
+        );
+        assert_eq!(scan.ignored, vec!["build/", "paper.aux"]);
+    }
+
+    #[tokio::test]
+    async fn resolving_document_conflict_updates_remote_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        let binding = ProjectBinding {
+            project_id: "p1".into(),
+            base_url: "https://example.test".into(),
+            profile: DEFAULT_PROFILE.into(),
+        };
+        binding.save(temp.path()).unwrap();
+        write_document(temp.path(), "/main.tex", "base\n").unwrap();
+        let base = workspace.checkpoint("base").await.unwrap();
+        let store = database(temp.path()).unwrap();
+        store
+            .upsert_document(
+                "p1",
+                "doc-1",
+                "/main.tex",
+                1,
+                &content_hash("base\n"),
+                Some(&base.operation_id),
+            )
+            .unwrap();
+        write_document(temp.path(), "/main.tex", "local\n").unwrap();
+
+        let conflict = StoredConflict {
+            project_id: "p1".into(),
+            kind: ConflictKind::Document,
+            entity_id: "doc-1".into(),
+            path: "/main.tex".into(),
+            remote_state: ConflictRemoteState::Present,
+            remote_version: Some(2),
+            remote_hash: Some(content_hash("remote\n")),
+            base_hash: Some(content_hash("base\n")),
+            parent_folder_id: None,
+            metadata_hash: Some("metadata".into()),
+            ranges_json: Some("[]".into()),
+            snapshot_metadata_json: Some("{}".into()),
+        };
+        let incoming = incoming_path(temp.path(), &conflict);
+        let mut manifest = ConflictManifest {
+            schema_version: 1,
+            conflicts: Vec::new(),
+        };
+        record_conflict(temp.path(), &mut manifest, conflict, Some(b"remote\n")).unwrap();
+        assert!(conflict_manifest_path(temp.path()).exists());
+        assert!(incoming.exists());
+
+        let detail = show_conflict(temp.path(), "main.tex").unwrap();
+        assert!(detail.diff.contains("-local"));
+        assert!(detail.diff.contains("+remote"));
+        let resolved = resolve_conflict(temp.path(), "main.tex", ConflictResolution::Ours)
+            .await
+            .unwrap();
+        assert_eq!(resolved.remaining_conflicts, 0);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("main.tex")).unwrap(),
+            "local\n"
+        );
+        let stored = database(temp.path())
+            .unwrap()
+            .document("p1", "doc-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.remote_version, 2);
+        assert_eq!(stored.remote_hash, content_hash("remote\n"));
+        assert!(!conflict_manifest_path(temp.path()).exists());
+        assert!(!incoming.exists());
+    }
+
+    #[tokio::test]
+    async fn accepting_remote_asset_deletion_removes_file_and_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        ProjectBinding {
+            project_id: "p1".into(),
+            base_url: "https://example.test".into(),
+            profile: DEFAULT_PROFILE.into(),
+        }
+        .save(temp.path())
+        .unwrap();
+        write_binary(temp.path(), "/figure.png", b"local").unwrap();
+        let base = workspace.checkpoint("base").await.unwrap();
+        let store = database(temp.path()).unwrap();
+        store
+            .upsert_asset(AssetCheckpoint {
+                project_id: "p1",
+                file_id: "asset-1",
+                path: "/figure.png",
+                parent_folder_id: "root",
+                remote_hash: &bytes_hash(b"base"),
+                size: 4,
+                jj_operation_id: Some(&base.operation_id),
+            })
+            .unwrap();
+        let conflict = StoredConflict {
+            project_id: "p1".into(),
+            kind: ConflictKind::Asset,
+            entity_id: "asset-1".into(),
+            path: "/figure.png".into(),
+            remote_state: ConflictRemoteState::Deleted,
+            remote_version: None,
+            remote_hash: None,
+            base_hash: Some(bytes_hash(b"base")),
+            parent_folder_id: Some("root".into()),
+            metadata_hash: None,
+            ranges_json: None,
+            snapshot_metadata_json: None,
+        };
+        let mut manifest = ConflictManifest {
+            schema_version: 1,
+            conflicts: Vec::new(),
+        };
+        record_conflict(temp.path(), &mut manifest, conflict, None).unwrap();
+
+        resolve_conflict(temp.path(), "figure.png", ConflictResolution::Theirs)
+            .await
+            .unwrap();
+        assert!(!temp.path().join("figure.png").exists());
+        assert!(
+            database(temp.path())
+                .unwrap()
+                .asset("p1", "asset-1")
+                .unwrap()
+                .is_none()
+        );
+        assert!(!conflict_manifest_path(temp.path()).exists());
     }
 
     #[test]

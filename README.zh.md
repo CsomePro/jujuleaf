@@ -164,6 +164,9 @@ JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告�
 | 下载编译后的 PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | 比较本地与远端状态 | <code>jujuleaf status</code> |
 | 拉取、推送或同步 | <code>jujuleaf pull</code>、<code>jujuleaf push</code>、<code>jujuleaf sync</code> |
+| 查看并解决冲突 | <code>jujuleaf conflict list</code>、<code>jujuleaf conflict show PATH</code>、<code>jujuleaf conflict resolve PATH</code> |
+| 查看本地历史 | <code>jujuleaf local log</code>、<code>jujuleaf local show REVISION</code>、<code>jujuleaf local diff</code> |
+| 检查环境与登录状态 | <code>jujuleaf doctor</code>、<code>jujuleaf auth status</code> |
 | 恢复本地历史 | <code>jujuleaf undo</code>、<code>jujuleaf redo</code> |
 
 运行 jujuleaf --help 或 jujuleaf COMMAND --help 可以查看完整命令和示例。
@@ -232,6 +235,69 @@ JujuLeaf 会针对每份文档或上传文件，把本地副本和 Overleaf 当�
 
 发送更新前和收到确认后，JujuLeaf 都会再次核对远端版本与内容哈希。新增文件和
 破坏性操作会被显式处理；发生冲突时，远端内容会保留下来供手动恢复。
+
+### 解决同步冲突
+
+pull 和 push 会记录未解决的冲突，但不会覆盖工作副本。先查看两侧内容，必要时
+合并，再明确选择解决方案：
+
+~~~bash
+jujuleaf conflict list
+jujuleaf conflict show main.tex
+jujuleaf conflict resolve main.tex --ours
+jujuleaf conflict resolve main.tex --theirs
+jujuleaf conflict resolve main.tex --merged /tmp/main.tex
+~~~
+
+`--ours` 保留本地文件，`--theirs` 接受已保存的远端副本，`--merged` 使用你准备
+好的合并文件。解决冲突时会创建可恢复的 Jujutsu checkpoint，并推进已观察到的
+远端基线；下一次 push 仍会在写入前重新核对实时远端状态。
+
+### 查看与恢复本地历史
+
+JujuLeaf 可以直接查看内嵌的 Jujutsu operation 历史：
+
+~~~bash
+jujuleaf local log
+jujuleaf local show OPERATION_ID
+jujuleaf local diff
+jujuleaf local restore OPERATION_ID
+~~~
+
+`local show` 接受 operation 或 commit ID 前缀，也可以用 `@` 表示当前 operation。
+`local restore` 会把目标 tree 恢复成一个新的 operation，因此恢复本身仍可撤销，
+后续历史也不会被抹掉。JujuLeaf 内嵌 jj-lib，无需额外安装或调用 `jj` 可执行文件；
+如果项目同时使用 Git，应直接使用 Jujutsu 自身的 Git 互操作能力，不在 JujuLeaf
+里重复实现一套 Git。
+
+### 忽略仅供本地使用的文件
+
+在 clone 根目录创建 `.jujuleafignore`，可以让匹配的生成文件或私密文件不被发现
+为上传候选，也不被 Jujutsu 首次跟踪。语法与 gitignore 一致：
+
+~~~gitignore
+/build/
+*.aux
+*.log
+.env
+~~~
+
+规则不会取消跟踪已经进入 checkpoint 的文件或已经同步的 Overleaf 实体。
+`.jj`、`.git`、`.jujuleaf` 和
+`.jujuleafignore` 始终视为私有内容，永远不会作为待上传文件。
+
+## 诊断与退出登录
+
+~~~bash
+jujuleaf auth status
+jujuleaf doctor
+jujuleaf doctor --offline
+jujuleaf auth logout
+~~~
+
+`doctor` 会检查所选 profile、凭据权限、浏览器、服务端连接、项目绑定、Jujutsu
+工作区和待处理同步状态；离线模式会跳过网络检查。`auth status` 永远不会打印
+Cookie；`auth logout` 会删除所选本地 profile 及其凭据。
 
 ## 当前限制
 
