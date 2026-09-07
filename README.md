@@ -18,6 +18,7 @@
 <p align="center">
   <a href="https://github.com/CsomePro/jujuleaf/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/CsomePro/jujuleaf/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/CsomePro/jujuleaf/releases"><img alt="GitHub release" src="https://img.shields.io/github/v/release/CsomePro/jujuleaf"></a>
+  <a href="https://crates.io/crates/jujuleaf"><img alt="crates.io" src="https://img.shields.io/crates/v/jujuleaf.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/CsomePro/jujuleaf"></a>
 </p>
 
@@ -47,7 +48,19 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 ## Install
 
-### Linux AMD64 binary
+### cargo-binstall (recommended)
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) installed,
+download the official prebuilt binary from GitHub Releases:
+
+~~~bash
+cargo binstall --strategies crate-meta-data jujuleaf
+~~~
+
+For unattended environments, add --no-confirm. The prebuilt release currently
+supports Linux AMD64.
+
+### Manual Linux AMD64 download
 
 Download the archive and checksum from the
 [latest release](https://github.com/CsomePro/jujuleaf/releases/latest), or
@@ -69,7 +82,7 @@ Make sure ~/.local/bin is on your PATH.
 JujuLeaf requires Rust 1.92 or newer:
 
 ~~~bash
-cargo install --git https://github.com/CsomePro/jujuleaf --tag v0.1.1
+cargo install --locked jujuleaf
 ~~~
 
 ## Quick start

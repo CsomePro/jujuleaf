@@ -7,6 +7,11 @@ description = "Local-first Overleaf collaboration powered by Jujutsu"
 license = "MIT"
 repository = "https://github.com/CsomePro/jujuleaf"
 
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.tar.gz"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
 [dependencies]
 anstyle = "1"
 anyhow = "1"

@@ -37,8 +37,10 @@ jujuleaf --version
 jujuleaf profile list --raw
 ```
 
-If `jujuleaf` is unavailable, tell the user to install it from the JujuLeaf
-GitHub Releases page or from source. Do not silently install software.
+If `jujuleaf` is unavailable, tell the user to install the official prebuilt
+release with `cargo binstall --strategies crate-meta-data jujuleaf`. Link to
+the JujuLeaf GitHub Releases page as a manual fallback. Do not silently install
+software.
 
 Attempt the requested read-only command before starting login. If authentication
 is missing, have the user complete the appropriate browser flow:

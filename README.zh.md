@@ -18,6 +18,7 @@
 <p align="center">
   <a href="https://github.com/CsomePro/jujuleaf/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/CsomePro/jujuleaf/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/CsomePro/jujuleaf/releases"><img alt="GitHub Release" src="https://img.shields.io/github/v/release/CsomePro/jujuleaf"></a>
+  <a href="https://crates.io/crates/jujuleaf"><img alt="crates.io" src="https://img.shields.io/crates/v/jujuleaf.svg"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/CsomePro/jujuleaf"></a>
 </p>
 
@@ -45,7 +46,18 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 ## 安装
 
-### Linux AMD64 预编译版本
+### cargo-binstall（推荐）
+
+安装 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) 后，可以
+直接从 GitHub Releases 下载官方预编译版本：
+
+~~~bash
+cargo binstall --strategies crate-meta-data jujuleaf
+~~~
+
+在无人值守环境中可增加 --no-confirm。预编译版本目前支持 Linux AMD64。
+
+### 手动下载 Linux AMD64 版本
 
 从 [最新 Release](https://github.com/CsomePro/jujuleaf/releases/latest)
 下载压缩包和校验文件，或者直接安装 v0.1.1：
@@ -66,7 +78,7 @@ jujuleaf --version
 JujuLeaf 需要 Rust 1.92 或更高版本：
 
 ~~~bash
-cargo install --git https://github.com/CsomePro/jujuleaf --tag v0.1.1
+cargo install --locked jujuleaf
 ~~~
 
 ## 快速开始
