@@ -56,7 +56,9 @@ jobs:
           mkdir -p "${asset_dir}"
           strip "target/${TARGET}/release/jujuleaf"
           install -m 0755 "target/${TARGET}/release/jujuleaf" "${asset_dir}/jujuleaf"
-          install -m 0644 README.md LICENSE "${asset_dir}/"
+          install -m 0644 README.md README.zh.md LICENSE "${asset_dir}/"
+          install -d -m 0755 "${asset_dir}/assets"
+          install -m 0644 assets/jujuleaf-logo.png "${asset_dir}/assets/"
           "${asset_dir}/jujuleaf" --version
 
           tar -C dist -czf "dist/${asset_name}.tar.gz" "${asset_name}"
