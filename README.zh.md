@@ -91,6 +91,7 @@ jujuleaf projects
 jujuleaf clone PROJECT_ID paper
 cd paper
 jujuleaf status
+jujuleaf
 ~~~
 
 登录命令会打开 Chrome 或 Chromium，并在本机保存登录会话。克隆完成后，
@@ -166,6 +167,8 @@ JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告�
 | 拉取、推送或同步 | <code>jujuleaf pull</code>、<code>jujuleaf push</code>、<code>jujuleaf sync</code> |
 | 查看并解决冲突 | <code>jujuleaf conflict list</code>、<code>jujuleaf conflict show PATH</code>、<code>jujuleaf conflict resolve PATH</code> |
 | 查看本地历史 | <code>jujuleaf local log</code>、<code>jujuleaf local show REVISION</code>、<code>jujuleaf local diff</code> |
+| 显示当前提交图 | <code>jujuleaf</code> |
+| 通过 Git 分享历史 | <code>jujuleaf git remote add origin URL</code>、<code>jujuleaf git fetch</code>、<code>jujuleaf git push</code> |
 | 检查环境与登录状态 | <code>jujuleaf doctor</code>、<code>jujuleaf auth status</code> |
 | 恢复本地历史 | <code>jujuleaf undo</code>、<code>jujuleaf redo</code> |
 
@@ -266,9 +269,39 @@ jujuleaf local restore OPERATION_ID
 
 `local show` 接受 operation 或 commit ID 前缀，也可以用 `@` 表示当前 operation。
 `local restore` 会把目标 tree 恢复成一个新的 operation，因此恢复本身仍可撤销，
-后续历史也不会被抹掉。JujuLeaf 内嵌 jj-lib，无需额外安装或调用 `jj` 可执行文件；
-如果项目同时使用 Git，应直接使用 Jujutsu 自身的 Git 互操作能力，不在 JujuLeaf
-里重复实现一套 Git。
+后续历史也不会被抹掉。JujuLeaf 内嵌 jj-lib，无需额外安装或调用 `jj` 可执行文件。
+
+在 clone 内不带子命令运行 `jujuleaf`，会先 snapshot 尚未记录的工作区改动，然后
+显示类似 `jj` 默认视图的紧凑彩色 first-parent 提交图。默认最多显示 10 条提交；
+operation 历史请用 `local log`，完整结构化提交数据请用 `jujuleaf --raw`。
+
+紧凑提交图使用与 jj 相似的 8 位显示 ID；其他人类可读输出会把 Jujutsu
+operation、commit 和 change ID 缩写为 12 位前缀。这个前缀可以直接传给
+`local show` 和 `local restore`；如果极少数情况下发生歧义，JujuLeaf 会要求
+提供更长的前缀。`--raw` 和 `--pretty` JSON 始终保留完整 ID。
+
+### 通过 Git 分享同一份历史
+
+每个 JujuLeaf clone 都已经由 `.jj` 内部的 bare Git 仓库提供存储。请通过
+JujuLeaf 配置和使用它，不要另建一套 `.git` working tree：
+
+~~~bash
+jujuleaf git root
+jujuleaf git remote add origin git@github.com:OWNER/REPOSITORY.git
+jujuleaf git push --branch main
+jujuleaf git fetch --remote origin
+jujuleaf git remote list
+~~~
+
+`git push` 会先记录尚未 checkpoint 的文件，再把当前 Jujutsu working-copy commit
+发布到指定分支，默认分支为 `main`。它把最后一次 fetch 到的远端位置作为 lease；
+如果远端出现预期外的新提交，push 会拒绝覆盖。更新已有分支前应先运行
+`git fetch`。Fetch 会把远端分支和 tag 导入 Jujutsu 历史，但不会替换当前工作副本。
+
+Remote 配置还支持 `remote remove`、`remote rename` 和 `remote set-url`。在 clone
+外运行时用 `-R PATH` 指定工作区。工作区仍由 `jujuleaf clone` 创建，不使用
+`jujuleaf git clone` 或 `git init`。不需要单独安装 `jj`；网络 fetch 和 push 会使用
+系统 Git 以及它已有的 SSH 或 credential helper 配置。
 
 ### 忽略仅供本地使用的文件
 

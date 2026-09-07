@@ -253,12 +253,46 @@ Use these commands deliberately:
 - Run `checkpoint` to snapshot the current work, not to create a work boundary.
 - Run `local log`, `local show REVISION`, and `local diff` to inspect embedded
   Jujutsu history. Prefer these read-only commands before a restoration.
+- Run `jujuleaf` without a subcommand for the compact current first-parent
+  commit graph. It snapshots pending working-copy changes; use `jujuleaf --raw`
+  when structured full commit IDs are needed.
 - Run `local restore REVISION` to restore a selected tree as a new recoverable
   operation; do not assume it erases later history.
 - Run `undo` and `redo` for JujuLeaf-managed local history outside an active
   review; do not manipulate the internal `.jj` repository directly.
 - Run `sync --watch` only for a foreground direct-sync loop. Expect it to stop
   on a conflict or Ctrl+C.
+
+## Interoperate with Git history
+
+A JujuLeaf clone already has a bare Git repository inside `.jj`. Use JujuLeaf's
+Git commands rather than creating or manipulating a second `.git` worktree:
+
+```bash
+jujuleaf git root --raw
+jujuleaf git remote list --raw
+jujuleaf git remote add origin GIT_URL --raw
+jujuleaf git fetch --remote origin --raw
+jujuleaf git push --remote origin --branch main --raw
+```
+
+Use `jujuleaf git remote remove`, `remote rename`, or `remote set-url` for remote
+configuration. Outside the clone, add `-R PATH`. Create a JujuLeaf workspace
+with `jujuleaf clone`; there is no separate `jujuleaf git clone` or `git init`
+flow.
+
+`git push` checkpoints pending files and publishes the current Jujutsu
+working-copy commit. It uses the last fetched remote position as a lease. If a
+remote branch may already exist or has advanced, fetch it before pushing and do
+not bypass a rejection. `git fetch` imports remote history but does not check it
+out into the working copy. These mutating Git commands are blocked during an
+active review. Let the system Git executable use its configured SSH agent or
+credential helper; never expose credentials in command arguments or output.
+
+The compact graph uses jj-style 8-character display IDs. Other human output
+abbreviates Jujutsu IDs to unambiguous-looking 12-character prefixes. Agent
+JSON from `--raw` retains complete IDs. Revision-taking local commands accept
+an unambiguous prefix and request more characters if needed.
 
 Put local generated or private paths in a root-level `.jujuleafignore`, using
 gitignore syntax. This affects discovery and checkpointing of new files; it does

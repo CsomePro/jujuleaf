@@ -22,7 +22,7 @@ use crate::operations::{
     parse_document_snapshot, slice_utf16, utf16_len, validate_history_operations,
     visible_to_source_position,
 };
-use crate::output::{OutputMode, notice, output};
+use crate::output::{OutputMode, notice, output, output_workspace_log};
 use crate::project::{collect_documents, connect_project_with_api, find_document, root_folder_id};
 use crate::review::{
     abort_review, begin_review, ensure_sync_allowed, finish_review_with_api, review_diff_with_api,
@@ -257,9 +257,14 @@ fn prepare_cli_args(
     }
 
     let Some((command_index, command)) = command_index(&arguments) else {
+        let context = discover_project_context(current_dir)?;
+        let context_profile = context.as_ref().and_then(|context| context.profile.clone());
+        if context.is_some() {
+            arguments.push(OsString::from("__workspace-log"));
+        }
         return Ok(PreparedCliArgs {
             arguments,
-            context_profile: None,
+            context_profile,
         });
     };
     let Some(shape) = project_argument_shape(command) else {
@@ -339,6 +344,10 @@ fn parse_cli(arguments: Vec<OsString>) -> Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Show the current workspace commit graph.
+    #[command(name = "__workspace-log", hide = true)]
+    WorkspaceLog,
+
     /// Sign in with Chrome/Chromium or an existing session cookie.
     Login {
         /// Use an existing Cookie header or a bare session-cookie value.
@@ -728,6 +737,14 @@ enum Command {
         #[command(subcommand)]
         command: LocalCommand,
     },
+    /// Interoperate with Git through the embedded Jujutsu repository.
+    #[command(
+        after_long_help = "JujuLeaf clones are already Git-backed. Use `remote`, `fetch`, and `push` here; create the workspace itself with `jujuleaf clone`. A separate `jj` executable is not required."
+    )]
+    Git {
+        #[command(subcommand)]
+        command: GitCommand,
+    },
     /// Pull remote documents without overwriting concurrent local edits.
     #[command(visible_alias = "fetch")]
     Pull {
@@ -965,6 +982,125 @@ enum LocalCommand {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+}
+
+#[derive(Args, Debug, Clone)]
+struct GitRepositoryArgs {
+    /// JujuLeaf clone or a path inside it.
+    #[arg(
+        short = 'R',
+        long = "repository",
+        visible_alias = "path",
+        default_value = "."
+    )]
+    path: PathBuf,
+}
+
+#[derive(Subcommand)]
+enum GitCommand {
+    /// Show the workspace root and embedded bare Git repository.
+    Root {
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// List or configure Git remotes.
+    Remote {
+        #[command(subcommand)]
+        command: GitRemoteCommand,
+    },
+    /// Fetch branches and tags into the embedded Jujutsu repository.
+    Fetch {
+        /// Git remote to fetch from.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Branch name or glob to fetch; repeat to fetch multiple branches.
+        #[arg(short = 'b', long = "branch")]
+        branches: Vec<String>,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// Push the current Jujutsu working-copy commit as a Git branch.
+    Push {
+        /// Git remote to push to.
+        #[arg(long, default_value = "origin")]
+        remote: String,
+        /// Git branch to create or update.
+        #[arg(
+            short = 'b',
+            long = "branch",
+            visible_alias = "bookmark",
+            default_value = "main"
+        )]
+        branch: String,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+}
+
+#[derive(Subcommand)]
+enum GitRemoteCommand {
+    /// List configured Git remotes and URLs.
+    List {
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// Add a Git remote.
+    Add {
+        /// Remote name, such as `origin`.
+        name: String,
+        /// Fetch URL.
+        url: String,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// Remove a Git remote and its remote-tracking bookmarks.
+    Remove {
+        /// Remote name.
+        name: String,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// Rename a Git remote.
+    Rename {
+        /// Existing remote name.
+        old_name: String,
+        /// New remote name.
+        new_name: String,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+    /// Change a Git remote URL.
+    SetUrl {
+        /// Remote name.
+        name: String,
+        /// New fetch URL.
+        url: String,
+        #[command(flatten)]
+        repository: GitRepositoryArgs,
+    },
+}
+
+impl GitCommand {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Root { repository }
+            | Self::Fetch { repository, .. }
+            | Self::Push { repository, .. } => &repository.path,
+            Self::Remote { command } => command.path(),
+        }
+    }
+}
+
+impl GitRemoteCommand {
+    fn path(&self) -> &Path {
+        match self {
+            Self::List { repository }
+            | Self::Add { repository, .. }
+            | Self::Remove { repository, .. }
+            | Self::Rename { repository, .. }
+            | Self::SetUrl { repository, .. } => &repository.path,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -1492,6 +1628,68 @@ fn search_zip(zip: &[u8], query: &str) -> Result<Value> {
     Ok(json!({"query": query, "matchCount": matches.len(), "matches": matches}))
 }
 
+async fn dispatch_git(command: GitCommand, mode: OutputMode) -> Result<()> {
+    let root = discover_root(command.path())?;
+    let _lock = WorkspaceOperationLock::acquire(&root, "git")?;
+    match command {
+        GitCommand::Root { .. } => {
+            let workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_root()?, mode)
+        }
+        GitCommand::Remote {
+            command: GitRemoteCommand::List { .. },
+        } => {
+            let workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_remotes()?, mode)
+        }
+        GitCommand::Remote {
+            command: GitRemoteCommand::Add { name, url, .. },
+        } => {
+            ensure_sync_allowed(&root, "git remote add")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_remote_add(&name, &url).await?, mode)
+        }
+        GitCommand::Remote {
+            command: GitRemoteCommand::Remove { name, .. },
+        } => {
+            ensure_sync_allowed(&root, "git remote remove")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_remote_remove(&name).await?, mode)
+        }
+        GitCommand::Remote {
+            command: GitRemoteCommand::Rename {
+                old_name, new_name, ..
+            },
+        } => {
+            ensure_sync_allowed(&root, "git remote rename")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(
+                workspace.git_remote_rename(&old_name, &new_name).await?,
+                mode,
+            )
+        }
+        GitCommand::Remote {
+            command: GitRemoteCommand::SetUrl { name, url, .. },
+        } => {
+            ensure_sync_allowed(&root, "git remote set-url")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_remote_set_url(&name, &url).await?, mode)
+        }
+        GitCommand::Fetch {
+            remote, branches, ..
+        } => {
+            ensure_sync_allowed(&root, "git fetch")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_fetch(&remote, &branches).await?, mode)
+        }
+        GitCommand::Push { remote, branch, .. } => {
+            ensure_sync_allowed(&root, "git push")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.git_push(&remote, &branch).await?, mode)
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     let prepared = prepare_cli_args(std::env::args_os(), &std::env::current_dir()?)?;
     let context_profile = prepared.context_profile;
@@ -1500,6 +1698,13 @@ pub async fn run() -> Result<()> {
     let explicit_profile = cli.profile;
     let _project_override = cli.project;
     match cli.command {
+        Command::WorkspaceLog => {
+            let root = discover_root(".")?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "workspace log")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            let summary = workspace.workspace_log(10).await?;
+            output_workspace_log(&summary, pretty)
+        }
         Command::Login {
             cookie,
             base_url,
@@ -1660,6 +1865,7 @@ pub async fn run() -> Result<()> {
                 output(workspace.restore(&revision).await?, pretty)
             }
         },
+        Command::Git { command } => dispatch_git(command, pretty).await,
         Command::Begin { message, path } => {
             let root = discover_root(path)?;
             let _lock = WorkspaceOperationLock::acquire(&root, "begin")?;
@@ -2244,12 +2450,14 @@ async fn dispatch_authenticated(
                 cycle += 1;
             }
         }
-        Command::Login { .. }
+        Command::WorkspaceLog
+        | Command::Login { .. }
         | Command::Profile { .. }
         | Command::Auth { .. }
         | Command::Doctor { .. }
         | Command::Conflict { .. }
         | Command::Local { .. }
+        | Command::Git { .. }
         | Command::Begin { .. }
         | Command::Status { .. }
         | Command::Checkpoint { .. }
@@ -2426,6 +2634,34 @@ mod tests {
                 command: LocalCommand::Show { internal: true, .. }
             }
         ));
+    }
+
+    #[test]
+    fn git_commands_parse_without_overleaf_credentials() {
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "https://example.test/paper.git",
+            "--repository",
+            "./paper",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Git {
+                command: GitCommand::Remote {
+                    command: GitRemoteCommand::Add {
+                        ref name,
+                        ref repository,
+                        ..
+                    }
+                }
+            } if name == "origin" && repository.path == Path::new("./paper")
+        ));
+        assert!(Cli::try_parse_from(["jujuleaf", "git", "push", "--branch", "paper"]).is_ok());
     }
 
     #[test]
@@ -2705,5 +2941,27 @@ mod tests {
             selected_profile(&profiles, None, Some("company"), &Command::Projects).unwrap(),
             "company"
         );
+    }
+
+    #[test]
+    fn no_command_selects_workspace_log_only_inside_a_clone() {
+        let project = tempfile::tempdir().unwrap();
+        ProjectBinding {
+            project_id: "p1".into(),
+            base_url: "https://example.test".into(),
+            profile: "work".into(),
+        }
+        .save(project.path())
+        .unwrap();
+        let prepared = prepare_cli_args([OsString::from("jujuleaf")], project.path()).unwrap();
+        assert_eq!(prepared.context_profile.as_deref(), Some("work"));
+        let cli = Cli::try_parse_from(prepared.arguments).unwrap();
+        assert!(matches!(cli.command, Command::WorkspaceLog));
+
+        let outside = tempfile::tempdir().unwrap();
+        let prepared = prepare_cli_args([OsString::from("jujuleaf")], outside.path()).unwrap();
+        assert_eq!(prepared.arguments.len(), 1);
+        assert!(prepared.context_profile.is_none());
+        assert!(Cli::try_parse_from(prepared.arguments).is_err());
     }
 }

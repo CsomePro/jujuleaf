@@ -6,6 +6,8 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::jj::WorkspaceLogSummary;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputMode {
     Human { color: bool },
@@ -38,9 +40,17 @@ enum Tone {
     GreenBold,
     Yellow,
     YellowBold,
+    BlueBold,
+    BrightBlueBold,
     Cyan,
     CyanBold,
+    BrightCyanBold,
     Magenta,
+    MagentaBold,
+    BrightMagentaBold,
+    BrightBlack,
+    BrightBlackBold,
+    BrightGreenBold,
 }
 
 fn terminal_color_enabled(no_color: bool, is_terminal: bool) -> bool {
@@ -62,9 +72,17 @@ fn tone_style(tone: Tone) -> Style {
         Tone::GreenBold => color(AnsiColor::Green.into()).bold(),
         Tone::Yellow => color(AnsiColor::Yellow.into()),
         Tone::YellowBold => color(AnsiColor::Yellow.into()).bold(),
+        Tone::BlueBold => color(AnsiColor::Blue.into()).bold(),
+        Tone::BrightBlueBold => color(AnsiColor::BrightBlue.into()).bold(),
         Tone::Cyan => color(AnsiColor::Cyan.into()),
         Tone::CyanBold => color(AnsiColor::Cyan.into()).bold(),
+        Tone::BrightCyanBold => color(AnsiColor::BrightCyan.into()).bold(),
         Tone::Magenta => color(AnsiColor::Magenta.into()),
+        Tone::MagentaBold => color(AnsiColor::Magenta.into()).bold(),
+        Tone::BrightMagentaBold => color(AnsiColor::BrightMagenta.into()).bold(),
+        Tone::BrightBlack => color(AnsiColor::BrightBlack.into()),
+        Tone::BrightBlackBold => color(AnsiColor::BrightBlack.into()).bold(),
+        Tone::BrightGreenBold => color(AnsiColor::BrightGreen.into()).bold(),
     }
 }
 
@@ -117,13 +135,13 @@ fn normalized_key(key: &str) -> String {
         .collect()
 }
 
-fn human_table_scalar(key: &str, value: &Value) -> String {
+fn human_display_scalar(key: &str, value: &Value) -> String {
     let text = human_scalar(value);
     let key = normalized_key(key);
-    if matches!(key.as_str(), "operationid" | "commitid" | "changeid")
-        && text.len() > 12
-        && text.is_ascii()
-    {
+    let is_jj_id = ["operationid", "commitid", "changeid"]
+        .iter()
+        .any(|suffix| key.ends_with(suffix));
+    if is_jj_id && text.len() > 12 && text.is_ascii() {
         format!("{}…", &text[..12])
     } else {
         text
@@ -318,7 +336,7 @@ fn write_table(output: &mut String, rows: &[Value], indent: usize, color: bool) 
                 .map(|column| {
                     object
                         .get(column)
-                        .map(|value| human_table_scalar(column, value))
+                        .map(|value| human_display_scalar(column, value))
                         .unwrap_or_default()
                 })
                 .collect()
@@ -412,7 +430,7 @@ fn write_scalar_list(output: &mut String, key: &str, values: &[Value], indent: u
     let tone = section_tone(key);
     let marker = section_marker(key);
     for value in values {
-        let text = human_scalar(value);
+        let text = human_display_scalar(key, value);
         let _ = writeln!(
             output,
             "{}{} {}",
@@ -477,7 +495,11 @@ fn write_human_object(
             " ".repeat(indent),
             paint(&label, Tone::Dim, color),
             " ".repeat(padding),
-            paint(&human_scalar(value), scalar_tone(key, value), color)
+            paint(
+                &human_display_scalar(key, value),
+                scalar_tone(key, value),
+                color,
+            )
         );
     }
 
@@ -564,6 +586,168 @@ fn write_human_value(
     }
 }
 
+fn graph_id(
+    id: &str,
+    unique_prefix_len: usize,
+    prefix_tone: Tone,
+    rest_tone: Tone,
+    color: bool,
+) -> String {
+    let display_len = 8.max(unique_prefix_len).min(id.len());
+    let prefix_len = unique_prefix_len.min(display_len);
+    let display = &id[..display_len];
+    let (prefix, rest) = display.split_at(prefix_len);
+    format!(
+        "{}{}",
+        paint(prefix, prefix_tone, color),
+        paint(rest, rest_tone, color)
+    )
+}
+
+fn graph_timestamp(timestamp: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|_| timestamp.to_owned())
+}
+
+pub(crate) fn render_workspace_log(summary: &WorkspaceLogSummary, color: bool) -> String {
+    let mut rendered = String::new();
+    for (index, entry) in summary.commits.iter().enumerate() {
+        let (marker, marker_tone) = if entry.current {
+            ("@", Tone::GreenBold)
+        } else if entry.root {
+            ("◆", Tone::BrightCyanBold)
+        } else if entry.conflict {
+            ("×", Tone::RedBold)
+        } else {
+            ("○", Tone::Plain)
+        };
+        let marker = paint(marker, marker_tone, color);
+        let change_id = graph_id(
+            &entry.change_id,
+            entry.change_id_prefix_len,
+            if entry.current {
+                Tone::BrightMagentaBold
+            } else {
+                Tone::MagentaBold
+            },
+            if entry.current {
+                Tone::BrightBlackBold
+            } else {
+                Tone::BrightBlack
+            },
+            color,
+        );
+        let commit_id = graph_id(
+            &entry.commit_id,
+            entry.commit_id_prefix_len,
+            if entry.current {
+                Tone::BrightBlueBold
+            } else {
+                Tone::BlueBold
+            },
+            if entry.current {
+                Tone::BrightBlackBold
+            } else {
+                Tone::BrightBlack
+            },
+            color,
+        );
+        if entry.root {
+            let _ = writeln!(
+                rendered,
+                "{marker}  {change_id} {} {commit_id}",
+                paint("root()", Tone::Green, color)
+            );
+            continue;
+        }
+
+        let author = if entry.author.is_empty() {
+            "unknown"
+        } else {
+            &entry.author
+        };
+        let author_tone = if entry.current {
+            Tone::YellowBold
+        } else {
+            Tone::Yellow
+        };
+        let timestamp_tone = if entry.current {
+            Tone::BrightCyanBold
+        } else {
+            Tone::Cyan
+        };
+        let _ = writeln!(
+            rendered,
+            "{marker}  {change_id} {} {} {commit_id}",
+            paint(author, author_tone, color),
+            paint(&graph_timestamp(&entry.timestamp), timestamp_tone, color),
+        );
+        let description = entry
+            .description
+            .lines()
+            .next()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or("(no description set)");
+        let mut annotations = Vec::new();
+        if entry.empty {
+            annotations.push(paint(
+                "(empty)",
+                if entry.current {
+                    Tone::BrightGreenBold
+                } else {
+                    Tone::Green
+                },
+                color,
+            ));
+        }
+        if entry.conflict {
+            annotations.push(paint("(conflict)", Tone::RedBold, color));
+        }
+        let annotation = if annotations.is_empty() {
+            String::new()
+        } else {
+            format!("{} ", annotations.join(" "))
+        };
+        let description_tone = if entry.description.trim().is_empty() {
+            if entry.empty {
+                if entry.current {
+                    Tone::BrightGreenBold
+                } else {
+                    Tone::Green
+                }
+            } else if entry.current {
+                Tone::YellowBold
+            } else {
+                Tone::Yellow
+            }
+        } else if entry.current {
+            Tone::Bold
+        } else {
+            Tone::Plain
+        };
+        let _ = writeln!(
+            rendered,
+            "{}  {annotation}{}",
+            paint("│", Tone::Plain, color),
+            paint(description, description_tone, color)
+        );
+        if index + 1 == summary.commits.len() && summary.truncated {
+            let _ = writeln!(
+                rendered,
+                "{}  {}",
+                paint("~", Tone::Dim, color),
+                paint(
+                    "older commits omitted; use `jujuleaf local log`",
+                    Tone::Dim,
+                    color
+                )
+            );
+        }
+    }
+    rendered.trim_end().to_owned()
+}
+
 pub(crate) fn render_human(value: &Value, color: bool) -> String {
     let mut rendered = String::new();
     write_human_value(&mut rendered, value, 0, color, true);
@@ -576,6 +760,15 @@ pub(crate) fn output(value: impl Serialize, mode: OutputMode) -> Result<()> {
         OutputMode::Human { color } => println!("{}", render_human(&value, color)),
         OutputMode::RawJson => println!("{}", serde_json::to_string(&value)?),
         OutputMode::PrettyJson => println!("{}", serde_json::to_string_pretty(&value)?),
+    }
+    Ok(())
+}
+
+pub(crate) fn output_workspace_log(summary: &WorkspaceLogSummary, mode: OutputMode) -> Result<()> {
+    match mode {
+        OutputMode::Human { color } => println!("{}", render_workspace_log(summary, color)),
+        OutputMode::RawJson => println!("{}", serde_json::to_string(summary)?),
+        OutputMode::PrettyJson => println!("{}", serde_json::to_string_pretty(summary)?),
     }
     Ok(())
 }
@@ -649,6 +842,7 @@ mod tests {
         let rendered = render_human(
             &json!({
                 "projectId": "project-identifier-must-remain-complete",
+                "currentOperationId": operation_id,
                 "entries": [{
                     "operationId": operation_id,
                     "commitId": "abcdef0123456789abcdef0123456789",
@@ -659,8 +853,61 @@ mod tests {
         );
         assert!(rendered.contains("0123456789ab…"));
         assert!(rendered.contains("abcdef012345…"));
+        assert_eq!(rendered.matches("0123456789ab…").count(), 2);
         assert!(!rendered.contains(operation_id));
         assert!(rendered.contains("project-identifier-must-remain-complete"));
+    }
+
+    #[test]
+    fn workspace_log_uses_a_compact_jj_style_graph() {
+        let summary = WorkspaceLogSummary {
+            workspace_root: "/paper".into(),
+            current_operation_id: "f".repeat(128),
+            commits: vec![
+                crate::jj::WorkspaceLogEntry {
+                    current: true,
+                    root: false,
+                    change_id: "zwxnntywabcdefghijklmnopqrstuvwx".into(),
+                    change_id_prefix_len: 2,
+                    commit_id: "c5bef9a20123456789abcdef0123456789abcdef".into(),
+                    commit_id_prefix_len: 2,
+                    parent_commit_ids: vec!["0".repeat(40)],
+                    author: "sync@jujuleaf.local".into(),
+                    timestamp: "2026-09-07T15:40:14+08:00".into(),
+                    description: "pull Overleaf project\nextra details".into(),
+                    empty: false,
+                    conflict: false,
+                },
+                crate::jj::WorkspaceLogEntry {
+                    current: false,
+                    root: true,
+                    change_id: "z".repeat(32),
+                    change_id_prefix_len: 1,
+                    commit_id: "0".repeat(40),
+                    commit_id_prefix_len: 1,
+                    parent_commit_ids: Vec::new(),
+                    author: String::new(),
+                    timestamp: "1970-01-01T00:00:00+00:00".into(),
+                    description: "root()".into(),
+                    empty: true,
+                    conflict: false,
+                },
+            ],
+            truncated: false,
+        };
+
+        let rendered = render_workspace_log(&summary, false);
+        assert_eq!(
+            rendered,
+            "@  zwxnntyw sync@jujuleaf.local 2026-09-07 15:40:14 c5bef9a2\n\
+             │  pull Overleaf project\n\
+             ◆  zzzzzzzz root() 00000000"
+        );
+        assert!(!rendered.contains(&"f".repeat(128)));
+
+        let colored = render_workspace_log(&summary, true);
+        assert!(colored.contains("\u{1b}["));
+        assert_eq!(strip_ansi(&colored), rendered);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,13 +10,25 @@ use jj_lib::config::{ConfigLayer, ConfigSource, StackedConfig};
 use jj_lib::default_backend_factories::{
     default_backend_factories, default_working_copy_factories,
 };
+use jj_lib::git::{
+    GitFetch, GitFetchRefExpression, GitImportOptions, GitProgress, GitPushOptions,
+    GitPushRefTargets, GitSettings, GitSidebandLineTerminator, GitSubprocessCallback, add_remote,
+    expand_fetch_refspecs, get_all_remote_names, get_git_backend, get_git_repo,
+    load_default_fetch_bookmarks, push_refs, remove_remote, rename_remote, set_remote_urls,
+    try_find_active_remote,
+};
+use jj_lib::id_prefix::IdPrefixIndex;
 use jj_lib::matchers::{EverythingMatcher, NothingMatcher};
+use jj_lib::merge::Diff;
 use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId;
+use jj_lib::op_store::RefTarget;
 use jj_lib::operation::Operation;
+use jj_lib::ref_name::{RefNameBuf, RemoteName, RemoteNameBuf};
 use jj_lib::repo::{ReadonlyRepo, Repo};
 use jj_lib::settings::UserSettings;
 use jj_lib::store::Store;
+use jj_lib::str_util::{StringExpression, StringPattern};
 use jj_lib::working_copy::SnapshotOptions;
 use jj_lib::workspace::Workspace;
 use serde::Serialize;
@@ -40,6 +54,32 @@ pub struct LocalHistoryEntry {
 pub struct LocalHistorySummary {
     pub current_operation_id: String,
     pub entries: Vec<LocalHistoryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLogEntry {
+    pub current: bool,
+    pub root: bool,
+    pub change_id: String,
+    pub change_id_prefix_len: usize,
+    pub commit_id: String,
+    pub commit_id_prefix_len: usize,
+    pub parent_commit_ids: Vec<String>,
+    pub author: String,
+    pub timestamp: String,
+    pub description: String,
+    pub empty: bool,
+    pub conflict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceLogSummary {
+    pub workspace_root: PathBuf,
+    pub current_operation_id: String,
+    pub commits: Vec<WorkspaceLogEntry>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -80,6 +120,60 @@ pub struct WorkChange {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRootSummary {
+    pub workspace_root: PathBuf,
+    pub git_repository: PathBuf,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemote {
+    pub name: String,
+    pub fetch_url: Option<String>,
+    pub push_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemotesSummary {
+    pub remotes: Vec<GitRemote>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitRemoteMutation {
+    pub success: bool,
+    pub action: String,
+    pub remote: String,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFetchSummary {
+    pub success: bool,
+    pub remote: String,
+    pub imported_bookmarks: usize,
+    pub imported_tags: usize,
+    pub failed_refs: Vec<String>,
+    pub operation_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitPushSummary {
+    pub success: bool,
+    pub remote: String,
+    pub branch: String,
+    pub pushed: Vec<String>,
+    pub rejected: Vec<String>,
+    pub operation_id: String,
+    pub commit_id: String,
+}
+
 pub struct JjWorkspace {
     root: PathBuf,
     workspace: Workspace,
@@ -101,6 +195,35 @@ fn settings() -> Result<UserSettings> {
         "#,
     )?);
     UserSettings::from_config(config).map_err(Into::into)
+}
+
+#[derive(Default)]
+struct SilentGitCallback;
+
+impl GitSubprocessCallback for SilentGitCallback {
+    fn needs_progress(&self) -> bool {
+        false
+    }
+
+    fn progress(&mut self, _progress: &GitProgress) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn local_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn remote_sideband(
+        &mut self,
+        _message: &[u8],
+        _term: Option<GitSidebandLineTerminator>,
+    ) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 impl JjWorkspace {
@@ -157,6 +280,372 @@ impl JjWorkspace {
 
     pub fn operation_id(&self) -> String {
         self.repo.op_id().hex()
+    }
+
+    /// Snapshot pending files and return the current first-parent commit graph.
+    pub async fn workspace_log(&mut self, limit: usize) -> Result<WorkspaceLogSummary> {
+        ensure!(limit > 0, "workspace log limit must be greater than zero");
+        let workspace_name = self.workspace.workspace_name().to_owned();
+        let current_commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let current_description = self
+            .repo
+            .store()
+            .get_commit_async(&current_commit_id)
+            .await?
+            .description()
+            .to_owned();
+        self.checkpoint(&current_description).await?;
+
+        let current_commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let root_commit_id = self.repo.store().root_commit_id().clone();
+        let mut commit = self
+            .repo
+            .store()
+            .get_commit_async(&current_commit_id)
+            .await?;
+        let mut commits = Vec::new();
+        let mut reached_root = false;
+        let id_prefix_index = IdPrefixIndex::empty();
+        for index in 0..limit {
+            let root = commit.id() == &root_commit_id;
+            let author = if !commit.author().email.is_empty() {
+                commit.author().email.clone()
+            } else {
+                commit.author().name.clone()
+            };
+            let timestamp = commit
+                .committer()
+                .timestamp
+                .to_datetime()
+                .context("commit timestamp is out of range")?
+                .to_rfc3339();
+            let parent_commit_ids = commit.parent_ids().iter().map(ObjectId::hex).collect();
+            let change_id_prefix_len = id_prefix_index
+                .shortest_change_prefix_len(self.repo.as_ref(), commit.change_id())
+                .await?;
+            let commit_id_prefix_len =
+                id_prefix_index.shortest_commit_prefix_len(self.repo.as_ref(), commit.id())?;
+            let entry = WorkspaceLogEntry {
+                current: index == 0,
+                root,
+                change_id: commit.change_id().reverse_hex(),
+                change_id_prefix_len,
+                commit_id: commit.id().hex(),
+                commit_id_prefix_len,
+                parent_commit_ids,
+                author,
+                timestamp,
+                description: if root {
+                    "root()".to_owned()
+                } else {
+                    commit.description().to_owned()
+                },
+                empty: commit.is_empty(self.repo.as_ref()).await?,
+                conflict: commit.has_conflict(),
+            };
+            commits.push(entry);
+            if root {
+                reached_root = true;
+                break;
+            }
+            let Some(parent_id) = commit.parent_ids().first() else {
+                break;
+            };
+            commit = self.repo.store().get_commit_async(parent_id).await?;
+        }
+        Ok(WorkspaceLogSummary {
+            workspace_root: self.root.clone(),
+            current_operation_id: self.repo.op_id().hex(),
+            commits,
+            truncated: !reached_root,
+        })
+    }
+
+    pub fn git_root(&self) -> Result<GitRootSummary> {
+        let backend = get_git_backend(self.repo.store())?;
+        Ok(GitRootSummary {
+            workspace_root: self.root.clone(),
+            git_repository: backend.git_repo_path().to_owned(),
+            operation_id: self.repo.op_id().hex(),
+        })
+    }
+
+    pub fn git_remotes(&self) -> Result<GitRemotesSummary> {
+        let git_repo = get_git_repo(self.repo.store())?;
+        let remotes = get_all_remote_names(self.repo.store())?
+            .into_iter()
+            .filter_map(|name| {
+                let remote = try_find_active_remote(&git_repo, &name).transpose()?;
+                Some(remote.map(|remote| {
+                    GitRemote {
+                        name: name.as_str().to_owned(),
+                        fetch_url: remote
+                            .url(gix::remote::Direction::Fetch)
+                            .map(ToString::to_string),
+                        push_url: remote
+                            .url(gix::remote::Direction::Push)
+                            .map(ToString::to_string),
+                    }
+                }))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GitRemotesSummary { remotes })
+    }
+
+    async fn reload_after_git_config_change(&mut self) -> Result<()> {
+        let refreshed = Self::open(&self.root).await?;
+        self.workspace = refreshed.workspace;
+        self.repo = refreshed.repo;
+        Ok(())
+    }
+
+    pub async fn git_remote_add(&mut self, name: &str, url: &str) -> Result<GitRemoteMutation> {
+        ensure!(!name.trim().is_empty(), "Git remote name cannot be empty");
+        ensure!(!url.trim().is_empty(), "Git remote URL cannot be empty");
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(self.workspace.workspace_name());
+        add_remote(transaction.repo_mut(), RemoteName::new(name), url, None)?;
+        let repo = transaction
+            .commit(format!("jujuleaf git remote add {name}"))
+            .await?;
+        let summary = GitRemoteMutation {
+            success: true,
+            action: "added".to_owned(),
+            remote: name.to_owned(),
+            operation_id: repo.op_id().hex(),
+        };
+        self.repo = repo;
+        self.reload_after_git_config_change().await?;
+        Ok(summary)
+    }
+
+    pub async fn git_remote_remove(&mut self, name: &str) -> Result<GitRemoteMutation> {
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(self.workspace.workspace_name());
+        remove_remote(transaction.repo_mut(), RemoteName::new(name))?;
+        let repo = transaction
+            .commit(format!("jujuleaf git remote remove {name}"))
+            .await?;
+        let summary = GitRemoteMutation {
+            success: true,
+            action: "removed".to_owned(),
+            remote: name.to_owned(),
+            operation_id: repo.op_id().hex(),
+        };
+        self.repo = repo;
+        self.reload_after_git_config_change().await?;
+        Ok(summary)
+    }
+
+    pub async fn git_remote_rename(
+        &mut self,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<GitRemoteMutation> {
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(self.workspace.workspace_name());
+        rename_remote(
+            transaction.repo_mut(),
+            RemoteName::new(old_name),
+            RemoteName::new(new_name),
+        )?;
+        let repo = transaction
+            .commit(format!("jujuleaf git remote rename {old_name} {new_name}"))
+            .await?;
+        let summary = GitRemoteMutation {
+            success: true,
+            action: "renamed".to_owned(),
+            remote: new_name.to_owned(),
+            operation_id: repo.op_id().hex(),
+        };
+        self.repo = repo;
+        self.reload_after_git_config_change().await?;
+        Ok(summary)
+    }
+
+    pub async fn git_remote_set_url(&mut self, name: &str, url: &str) -> Result<GitRemoteMutation> {
+        ensure!(!url.trim().is_empty(), "Git remote URL cannot be empty");
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(self.workspace.workspace_name());
+        set_remote_urls(
+            transaction.repo_mut().store(),
+            RemoteName::new(name),
+            Some(url),
+            None,
+        )?;
+        let repo = transaction
+            .commit(format!("jujuleaf git remote set-url {name}"))
+            .await?;
+        let summary = GitRemoteMutation {
+            success: true,
+            action: "updated".to_owned(),
+            remote: name.to_owned(),
+            operation_id: repo.op_id().hex(),
+        };
+        self.repo = repo;
+        self.reload_after_git_config_change().await?;
+        Ok(summary)
+    }
+
+    pub async fn git_fetch(
+        &mut self,
+        remote_name: &str,
+        branches: &[String],
+    ) -> Result<GitFetchSummary> {
+        self.checkpoint("capture local state before git fetch")
+            .await?;
+        let remote = RemoteNameBuf::from(remote_name);
+        let git_repo = get_git_repo(self.repo.store())?;
+        let bookmark = if branches.is_empty() {
+            let (_, expression) = load_default_fetch_bookmarks(&remote, &git_repo)?;
+            expression
+        } else {
+            StringExpression::union_all(
+                branches
+                    .iter()
+                    .map(|branch| StringPattern::glob(branch).map(StringExpression::pattern))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+        };
+        let refspecs = expand_fetch_refspecs(
+            &remote,
+            GitFetchRefExpression {
+                bookmark,
+                tag: StringExpression::all(),
+            },
+        )?;
+        let user_settings = settings()?;
+        let git_settings = GitSettings::from_settings(&user_settings)?;
+        let import_options = GitImportOptions {
+            abandon_unreachable_commits: git_settings.abandon_unreachable_commits,
+            record_synthetic_predecessors: git_settings.record_synthetic_predecessors,
+            remote_auto_track_bookmarks: HashMap::new(),
+        };
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(self.workspace.workspace_name());
+        let stats = {
+            let mut callback = SilentGitCallback;
+            let mut fetch = GitFetch::new(
+                transaction.repo_mut(),
+                git_settings.to_subprocess_options(),
+                &import_options,
+            )?;
+            fetch.fetch(&remote, refspecs, &mut callback, None)?;
+            fetch.import_refs().await?
+        };
+        let failed_refs = stats
+            .failed_ref_names
+            .iter()
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .collect();
+        let imported_bookmarks = stats.changed_remote_bookmarks.len();
+        let imported_tags = stats.changed_remote_tags.len();
+        let repo = transaction
+            .commit(format!("jujuleaf git fetch {remote_name}"))
+            .await?;
+        let summary = GitFetchSummary {
+            success: stats.failed_ref_names.is_empty(),
+            remote: remote_name.to_owned(),
+            imported_bookmarks,
+            imported_tags,
+            failed_refs,
+            operation_id: repo.op_id().hex(),
+        };
+        self.repo = repo;
+        Ok(summary)
+    }
+
+    pub async fn git_push(
+        &mut self,
+        remote_name: &str,
+        branch_name: &str,
+    ) -> Result<GitPushSummary> {
+        ensure!(
+            !branch_name.trim().is_empty(),
+            "Git branch name cannot be empty"
+        );
+        self.checkpoint("capture local state before git push")
+            .await?;
+        let workspace_name = self.workspace.workspace_name().to_owned();
+        let commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let remote = RemoteNameBuf::from(remote_name);
+        let branch = RefNameBuf::from(branch_name);
+        let expected = self
+            .repo
+            .view()
+            .get_remote_bookmark(branch.to_remote_symbol(&remote))
+            .target
+            .as_resolved()
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "remote branch '{branch_name}@{remote_name}' is conflicted; fetch and resolve it first"
+                )
+            })?;
+        let user_settings = settings()?;
+        let git_settings = GitSettings::from_settings(&user_settings)?;
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(&workspace_name);
+        transaction
+            .repo_mut()
+            .set_local_bookmark_target(&branch, RefTarget::normal(commit_id.clone()));
+        let targets = GitPushRefTargets {
+            bookmarks: vec![(branch.clone(), Diff::new(expected, Some(commit_id.clone())))],
+            tags: Vec::new(),
+        };
+        let mut callback = SilentGitCallback;
+        let stats = push_refs(
+            transaction.repo_mut(),
+            git_settings.to_subprocess_options(),
+            &remote,
+            &targets,
+            &mut callback,
+            &GitPushOptions::default(),
+        )?;
+        let pushed = stats
+            .pushed
+            .iter()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        let rejected = stats
+            .rejected
+            .iter()
+            .chain(stats.remote_rejected.iter())
+            .map(|(name, reason)| match reason {
+                Some(reason) => format!("{}: {reason}", name.as_str()),
+                None => name.as_str().to_owned(),
+            })
+            .collect();
+        let success = stats.all_ok();
+        let repo = transaction
+            .commit(format!("jujuleaf git push {branch_name} to {remote_name}"))
+            .await?;
+        let summary = GitPushSummary {
+            success,
+            remote: remote_name.to_owned(),
+            branch: branch_name.to_owned(),
+            pushed,
+            rejected,
+            operation_id: repo.op_id().hex(),
+            commit_id: commit_id.hex(),
+        };
+        self.repo = repo;
+        Ok(summary)
     }
 
     pub async fn checkpoint(&mut self, description: &str) -> Result<Checkpoint> {
@@ -918,5 +1407,115 @@ mod tests {
                 .any(|file| file.path == ignore::IGNORE_FILE)
         );
         assert!(!shown.files.iter().any(|file| file.path == "paper.aux"));
+    }
+
+    #[tokio::test]
+    async fn manages_git_remotes_in_the_embedded_repository() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        let root = workspace.git_root().unwrap();
+        assert_eq!(root.workspace_root, temp.path());
+        assert!(root.git_repository.is_dir());
+
+        workspace
+            .git_remote_add("origin", "https://example.test/paper.git")
+            .await
+            .unwrap();
+        let remotes = workspace.git_remotes().unwrap();
+        assert_eq!(remotes.remotes.len(), 1);
+        assert_eq!(remotes.remotes[0].name, "origin");
+        assert_eq!(
+            remotes.remotes[0].fetch_url.as_deref(),
+            Some("https://example.test/paper.git")
+        );
+        assert_eq!(
+            remotes.remotes[0].push_url.as_deref(),
+            Some("https://example.test/paper.git")
+        );
+
+        workspace
+            .git_remote_set_url("origin", "https://example.test/new.git")
+            .await
+            .unwrap();
+        workspace
+            .git_remote_rename("origin", "mirror")
+            .await
+            .unwrap();
+        assert_eq!(workspace.git_remotes().unwrap().remotes[0].name, "mirror");
+        workspace.git_remote_remove("mirror").await.unwrap();
+        assert!(workspace.git_remotes().unwrap().remotes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pushes_and_fetches_with_a_local_git_remote() {
+        let remote = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(remote.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let source = tempfile::tempdir().unwrap();
+        let mut source_workspace = JjWorkspace::init(source.path()).await.unwrap();
+        std::fs::write(source.path().join("main.tex"), "hello from JujuLeaf\n").unwrap();
+        let checkpoint = source_workspace.checkpoint("initial paper").await.unwrap();
+        source_workspace
+            .git_remote_add("origin", &remote.path().to_string_lossy())
+            .await
+            .unwrap();
+        let push = source_workspace.git_push("origin", "main").await.unwrap();
+        assert!(push.success, "rejected refs: {:?}", push.rejected);
+        assert_eq!(push.commit_id, checkpoint.commit_id);
+
+        let remote_commit = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(remote.path())
+            .args(["rev-parse", "refs/heads/main"])
+            .output()
+            .unwrap();
+        assert!(remote_commit.status.success());
+        assert_eq!(
+            String::from_utf8(remote_commit.stdout).unwrap().trim(),
+            checkpoint.commit_id
+        );
+
+        let destination = tempfile::tempdir().unwrap();
+        let mut destination_workspace = JjWorkspace::init(destination.path()).await.unwrap();
+        destination_workspace
+            .git_remote_add("origin", &remote.path().to_string_lossy())
+            .await
+            .unwrap();
+        let fetch = destination_workspace
+            .git_fetch("origin", &["main".to_owned()])
+            .await
+            .unwrap();
+        assert!(fetch.success);
+        assert_eq!(fetch.imported_bookmarks, 1);
+    }
+
+    #[tokio::test]
+    async fn workspace_log_snapshots_files_and_reaches_the_root_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        std::fs::write(temp.path().join("main.tex"), "draft\n").unwrap();
+
+        let summary = workspace.workspace_log(10).await.unwrap();
+        assert_eq!(summary.workspace_root, temp.path());
+        assert!(!summary.truncated);
+        assert!(summary.commits.first().unwrap().current);
+        assert_eq!(summary.commits.first().unwrap().description, "");
+        assert_eq!(summary.commits.first().unwrap().change_id.len(), 32);
+        assert!(summary.commits.last().unwrap().root);
+        assert_eq!(summary.commits.last().unwrap().description, "root()");
+        assert!(
+            workspace
+                .show("@", false)
+                .await
+                .unwrap()
+                .files
+                .iter()
+                .any(|file| file.path == "main.tex")
+        );
     }
 }

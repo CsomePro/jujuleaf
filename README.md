@@ -95,6 +95,7 @@ jujuleaf projects
 jujuleaf clone PROJECT_ID paper
 cd paper
 jujuleaf status
+jujuleaf
 ~~~
 
 The login command opens Chrome or Chromium and saves the authenticated session
@@ -171,6 +172,8 @@ foreign or partially resolved changes before closing it.
 | Pull, push, or synchronize | <code>jujuleaf pull</code>, <code>jujuleaf push</code>, <code>jujuleaf sync</code> |
 | Inspect and resolve conflicts | <code>jujuleaf conflict list</code>, <code>jujuleaf conflict show PATH</code>, <code>jujuleaf conflict resolve PATH</code> |
 | Inspect local history | <code>jujuleaf local log</code>, <code>jujuleaf local show REVISION</code>, <code>jujuleaf local diff</code> |
+| Show the current commit graph | <code>jujuleaf</code> |
+| Share through Git | <code>jujuleaf git remote add origin URL</code>, <code>jujuleaf git fetch</code>, <code>jujuleaf git push</code> |
 | Check setup and authentication | <code>jujuleaf doctor</code>, <code>jujuleaf auth status</code> |
 | Restore local history | <code>jujuleaf undo</code>, <code>jujuleaf redo</code> |
 
@@ -279,9 +282,45 @@ jujuleaf local restore OPERATION_ID
 `local show` accepts an operation or commit ID prefix, or `@` for the current
 operation. `local restore` restores that tree as a new operation, so the restore
 itself can be undone and does not erase later history. JujuLeaf embeds jj-lib;
-installing or invoking the separate `jj` executable is not required. Projects
-that also use Git should rely on Jujutsu's own Git interoperability rather than
-a second Git implementation inside JujuLeaf.
+installing or invoking the separate `jj` executable is not required.
+
+Inside a clone, running `jujuleaf` without a subcommand snapshots pending
+working-copy changes and displays a compact, colored first-parent commit graph,
+similar to the default `jj` view. It shows up to 10 commits; use `local log` for
+operation history and `jujuleaf --raw` for the full structured commit data.
+
+The compact graph uses jj-style 8-character display IDs. Elsewhere,
+human-readable output abbreviates Jujutsu operation, commit, and change IDs to
+a 12-character prefix. These prefixes can be passed back to `local show` and
+`local restore`; if one is ever ambiguous, JujuLeaf asks for a longer prefix.
+`--raw` and `--pretty` JSON always retain the complete IDs.
+
+### Share the same history through Git
+
+Every JujuLeaf clone is already backed by a bare Git repository inside `.jj`.
+Configure and use it through JujuLeaf without creating a second `.git` working
+tree:
+
+~~~bash
+jujuleaf git root
+jujuleaf git remote add origin git@github.com:OWNER/REPOSITORY.git
+jujuleaf git push --branch main
+jujuleaf git fetch --remote origin
+jujuleaf git remote list
+~~~
+
+`git push` snapshots pending files and publishes the current Jujutsu
+working-copy commit under the selected branch (default: `main`). It uses the
+last fetched remote position as a lease, so an unexpected remote update is
+rejected instead of overwritten. Run `git fetch` first when updating an
+existing branch. Fetch imports remote branches and tags into Jujutsu history;
+it does not replace the working copy.
+
+Remote configuration also supports `remote remove`, `remote rename`, and
+`remote set-url`. Use `-R PATH` when running outside the clone. Create the
+workspace with `jujuleaf clone`, not `jujuleaf git clone` or `git init`. A
+separate `jj` executable is unnecessary; network fetch and push use the system
+Git executable and its normal SSH or credential-helper configuration.
 
 ### Ignore local-only files
 
