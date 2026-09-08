@@ -96,10 +96,10 @@ jobs:
           echo "CC_${target_env}=musl-gcc" >> "${GITHUB_ENV}"
           echo "CARGO_TARGET_${target_env^^}_LINKER=musl-gcc" >> "${GITHUB_ENV}"
 
-      - name: Run target checks
+      - name: Run native tests and target lint
         run: |
           cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
-          cargo test --all-targets --locked --target ${{ matrix.target }}
+          cargo test --all-targets --locked
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -142,6 +142,7 @@ jobs:
           fi
 
           "${asset_dir}/jujuleaf" --version
+          "${asset_dir}/jujuleaf" skill validate --raw
           tar -C dist -czf "dist/${asset_name}.tar.gz" "${asset_name}"
 
       - name: Package Windows archive
@@ -155,6 +156,7 @@ jobs:
           Copy-Item README.md, README.zh.md, LICENSE $assetDir
           Copy-Item assets\jujuleaf-logo.png "$assetDir\assets\"
           & "$assetDir\jujuleaf.exe" --version
+          & "$assetDir\jujuleaf.exe" skill validate --raw
           Compress-Archive -Path $assetDir -DestinationPath "dist\$assetName.zip"
 
       - uses: actions/upload-artifact@v4
