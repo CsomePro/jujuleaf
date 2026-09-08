@@ -286,6 +286,34 @@ pub fn visible_to_source_position(position: usize, state: &DocumentState) -> Res
     Ok(mapped)
 }
 
+/// Translate a history-OT source coordinate into the visible CodeMirror
+/// coordinate space, collapsing tracked deletions to their visible boundary.
+pub fn source_to_visible_position(position: usize, state: &DocumentState) -> Result<usize> {
+    let source_len = utf16_len(&state.source_content);
+    ensure!(
+        position <= source_len,
+        "source position {position} is outside document range 0..{source_len}"
+    );
+    if state.ot_type != HISTORY_OT {
+        return Ok(position);
+    }
+
+    let mut hidden = 0;
+    let mut source_cursor = 0;
+    for range in &state.tracked_delete_ranges {
+        if range.pos < source_cursor || range.pos > source_len {
+            continue;
+        }
+        let end = source_len.min(range.pos.saturating_add(range.length));
+        if position <= range.pos {
+            break;
+        }
+        hidden += position.min(end) - range.pos;
+        source_cursor = end;
+    }
+    Ok(position - hidden)
+}
+
 pub fn normalize_changes(inputs: &[InputChange], content: &str) -> Result<Vec<Change>> {
     let content_len = utf16_len(content);
     let mut previous_to = 0;

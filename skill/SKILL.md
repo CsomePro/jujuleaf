@@ -167,6 +167,21 @@ Inspect thread and document IDs before replying, resolving, reopening, editing,
 or deleting comments. Do not resolve or delete collaborators' threads unless the
 user requests it.
 
+For a long-running worker or another program that needs a stable compatibility
+contract, use the versioned bridge instead of parsing `threads --raw` or the raw
+`watch` event stream:
+
+```bash
+jujuleaf bridge describe
+jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments watch --protocol 1
+```
+
+Treat `comments.snapshot` records as authoritative replacements. Treat
+`comment.event` records as wake-up notifications and re-read the affected
+thread with `comments get`.
+
 ## Review 修改范式
 
 Use this as the default local workflow whenever collaborators should review a

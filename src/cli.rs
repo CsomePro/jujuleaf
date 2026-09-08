@@ -13,6 +13,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::api::OverleafApi;
 use crate::auth::{LoginPreset, ProfileStore, Session, SessionStore, interactive_login};
+use crate::bridge::{self, BridgeCommand};
 use crate::compile::{build_compile_report, has_output};
 use crate::doctor;
 use crate::jj::JjWorkspace;
@@ -268,10 +269,14 @@ fn prepare_cli_args(
         });
     };
     let Some(shape) = project_argument_shape(command) else {
+        let context_profile = if command == "bridge" {
+            None
+        } else {
+            discover_project_context(current_dir)?.and_then(|context| context.profile)
+        };
         return Ok(PreparedCliArgs {
             arguments,
-            context_profile: discover_project_context(current_dir)?
-                .and_then(|context| context.profile),
+            context_profile,
         });
     };
     let positions = positional_indices(&arguments, command_index);
@@ -383,6 +388,11 @@ enum Command {
         /// Skip the authenticated Overleaf endpoint check.
         #[arg(long)]
         offline: bool,
+    },
+    /// Expose a stable JSON/NDJSON protocol for external tools.
+    Bridge {
+        #[command(subcommand)]
+        command: BridgeCommand,
     },
     /// List Overleaf projects.
     #[command(visible_alias = "ls-projects")]
@@ -1691,13 +1701,27 @@ async fn dispatch_git(command: GitCommand, mode: OutputMode) -> Result<()> {
 }
 
 pub async fn run() -> Result<()> {
-    let prepared = prepare_cli_args(std::env::args_os(), &std::env::current_dir()?)?;
+    let current_dir = std::env::current_dir()?;
+    let prepared = prepare_cli_args(std::env::args_os(), &current_dir)?;
     let context_profile = prepared.context_profile;
     let cli = parse_cli(prepared.arguments);
+    let bridge_raw = cli.raw;
+    let bridge_pretty = cli.pretty;
     let pretty = OutputMode::from_flags(cli.raw, cli.pretty, cli.no_color);
     let explicit_profile = cli.profile;
-    let _project_override = cli.project;
+    let project_override = cli.project;
     match cli.command {
+        Command::Bridge { command } => {
+            bridge::run(
+                command,
+                explicit_profile,
+                project_override,
+                &current_dir,
+                bridge_raw,
+                bridge_pretty,
+            )
+            .await
+        }
         Command::WorkspaceLog => {
             let root = discover_root(".")?;
             let _lock = WorkspaceOperationLock::acquire(&root, "workspace log")?;
@@ -2455,6 +2479,7 @@ async fn dispatch_authenticated(
         | Command::Profile { .. }
         | Command::Auth { .. }
         | Command::Doctor { .. }
+        | Command::Bridge { .. }
         | Command::Conflict { .. }
         | Command::Local { .. }
         | Command::Git { .. }
@@ -2469,6 +2494,7 @@ async fn dispatch_authenticated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::BridgeCommentsCommand;
 
     #[test]
     fn cli_definition_is_consistent() {
@@ -2911,6 +2937,32 @@ mod tests {
                 command: ReviewCommand::Submit { .. }
             }
         ));
+    }
+
+    #[test]
+    fn bridge_commands_parse_as_a_dedicated_protocol_namespace() {
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "bridge",
+            "comments",
+            "get",
+            "thread-1",
+            "--protocol",
+            "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Bridge {
+                command: BridgeCommand::Comments {
+                    command: BridgeCommentsCommand::Get { ref thread_id, .. }
+                }
+            } if thread_id == "thread-1"
+        ));
+
+        Cli::try_parse_from(["jujuleaf", "bridge", "describe"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "bridge", "comments", "list"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "bridge", "comments", "watch"]).unwrap();
     }
 
     #[test]

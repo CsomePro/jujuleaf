@@ -44,7 +44,8 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 - **Native collaboration.** Exact edits, tracked changes, comments, compilation,
   PDFs, project history, and live events use Overleaf collaboration features.
 - **Human and machine friendly.** The default output is readable and colorful;
-  compact or pretty JSON is available for scripts and agents.
+  compact JSON is available for scripts, while `jujuleaf bridge` exposes a
+  stable, versioned process protocol for long-lived integrations.
 
 ## Install
 
@@ -166,6 +167,7 @@ foreign or partially resolved changes before closing it.
 | Replace exact text | <code>jujuleaf replace main.tex --old "draft" --new "final"</code> |
 | Submit one tracked edit | <code>jujuleaf suggest main.tex --old "draft" --new "final"</code> |
 | View comment threads | <code>jujuleaf threads</code> |
+| Integrate an external worker | <code>jujuleaf bridge describe</code>, <code>jujuleaf bridge comments watch</code> |
 | Compile and inspect diagnostics | <code>jujuleaf compile</code> |
 | Download the compiled PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | Compare local and remote state | <code>jujuleaf status</code> |
@@ -233,6 +235,32 @@ jujuleaf projects --pretty
 Both --raw and --pretty produce ANSI-free JSON, so an additional --no-color is
 not needed. Agents can use the bundled [SKILL.md](skill/SKILL.md) as a compact
 command guide.
+
+### Stable process integration
+
+`--raw` follows JujuLeaf's internal command output and may grow with the CLI.
+External workers that need a compatibility contract should use the dedicated
+bridge instead:
+
+~~~bash
+jujuleaf bridge describe
+jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments watch --protocol 1
+~~~
+
+Bridge commands always emit compact, ANSI-free JSON. `comments.watch` emits
+NDJSON and starts with an authoritative comment snapshot before live events.
+It periodically emits another full snapshot, reconnects automatically, and
+uses events only as wake-up notifications. A worker should replace its known
+state on `comments.snapshot` and fetch `comments.get` after a `comment.event`.
+
+The bridge normalizes thread messages, multi-range anchors, detached anchors,
+document paths, UTF-16 source and visible ranges, and content hashes. It does
+not expose Overleaf's private event names or history-OT payloads. Every record
+contains protocol identity and version; failures use stable error codes and a
+non-zero process exit status. See the [bridge protocol](docs/bridge-protocol.md)
+for the complete contract and stream lifecycle.
 
 ## Synchronization safety
 

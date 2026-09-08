@@ -41,8 +41,8 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
   无需额外安装 jj 命令。
 - **保留协作能力。** 精确编辑、修订模式、评论、编译、PDF、项目历史和实时
   事件都通过 Overleaf 的协作能力完成。
-- **人和 Agent 都友好。** 默认输出清晰且带颜色；脚本和 Agent 可选择紧凑或
-  格式化 JSON。
+- **人和 Agent 都友好。** 默认输出清晰且带颜色；普通脚本可以使用紧凑 JSON，
+  长期运行的集成则可以通过 `jujuleaf bridge` 使用稳定、带版本的进程协议。
 
 ## 安装
 
@@ -161,6 +161,7 @@ JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告�
 | 精确替换文本 | <code>jujuleaf replace main.tex --old "草稿" --new "终稿"</code> |
 | 提交一处修订 | <code>jujuleaf suggest main.tex --old "草稿" --new "终稿"</code> |
 | 查看评论线程 | <code>jujuleaf threads</code> |
+| 接入外部 worker | <code>jujuleaf bridge describe</code>、<code>jujuleaf bridge comments watch</code> |
 | 编译并查看诊断 | <code>jujuleaf compile</code> |
 | 下载编译后的 PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | 比较本地与远端状态 | <code>jujuleaf status</code> |
@@ -223,6 +224,28 @@ jujuleaf projects --pretty
 
 --raw 和 --pretty 输出的 JSON 天然不包含 ANSI 颜色，因此不需要再传
 --no-color。Agent 可以读取仓库内的 [SKILL.md](skill/SKILL.md) 作为精简命令指南。
+
+### 稳定的进程级集成
+
+`--raw` 跟随 JujuLeaf 各命令的内部输出演进；需要长期兼容的外部 worker 应使用
+专门的 bridge：
+
+~~~bash
+jujuleaf bridge describe
+jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments watch --protocol 1
+~~~
+
+Bridge 命令固定输出紧凑、无 ANSI 的 JSON。`comments.watch` 使用 NDJSON，先输出
+一份权威评论快照，再进入实时事件流；它还会定期重新对账并在断线后自动重连。
+事件只用于快速唤醒：worker 收到 `comments.snapshot` 时替换已知状态，收到
+`comment.event` 后再读取 `comments.get`。
+
+Bridge 会在 Rust 端统一关联线程消息、多范围或 detached 锚点、文档路径、UTF-16
+原始/可见坐标和内容哈希，不会泄漏 Overleaf 私有事件名或 history-OT payload。
+每条记录都包含协议名称和版本；失败时输出稳定错误码并以非零状态退出。完整字段
+及事件流生命周期见 [Bridge 协议说明](docs/bridge-protocol.md)。
 
 ## 同步如何保护数据
 

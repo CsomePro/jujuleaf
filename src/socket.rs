@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -73,6 +74,7 @@ pub struct OverleafSocket {
     base_url: String,
     cookie: String,
     project_id: String,
+    pending_events: VecDeque<RealtimeEvent>,
 }
 
 fn now_ms() -> u128 {
@@ -180,6 +182,7 @@ impl OverleafSocket {
             base_url: base_url.to_owned(),
             cookie: ws_cookie,
             project_id: project_id.to_owned(),
+            pending_events: VecDeque::new(),
         };
         let connected = timeout(Duration::from_secs(10), async {
             loop {
@@ -234,10 +237,14 @@ impl OverleafSocket {
     async fn wait_for_ack(&mut self, id: u64, wait: Duration) -> Result<Vec<Value>> {
         timeout(wait, async {
             loop {
-                if let Packet::Ack { id: ack_id, args } = self.read_packet().await?
-                    && ack_id == id
-                {
-                    return Ok::<_, anyhow::Error>(args);
+                match self.read_packet().await? {
+                    Packet::Ack { id: ack_id, args } if ack_id == id => {
+                        return Ok::<_, anyhow::Error>(args);
+                    }
+                    Packet::Event { name, args } => {
+                        self.pending_events.push_back(RealtimeEvent { name, args });
+                    }
+                    _ => {}
                 }
             }
         })
@@ -250,10 +257,14 @@ impl OverleafSocket {
             .await?;
         let args = timeout(Duration::from_secs(30), async {
             loop {
-                if let Packet::Event { name, args } = self.read_packet().await?
-                    && name == "joinProjectResponse"
-                {
-                    return Ok::<_, anyhow::Error>(args);
+                match self.read_packet().await? {
+                    Packet::Event { name, args } if name == "joinProjectResponse" => {
+                        return Ok::<_, anyhow::Error>(args);
+                    }
+                    Packet::Event { name, args } => {
+                        self.pending_events.push_back(RealtimeEvent { name, args });
+                    }
+                    _ => {}
                 }
             }
         })
@@ -445,6 +456,9 @@ impl OverleafSocket {
     }
 
     pub async fn next_event(&mut self) -> Result<RealtimeEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
         loop {
             if let Packet::Event { name, args } = self.read_packet().await? {
                 return Ok(RealtimeEvent { name, args });
