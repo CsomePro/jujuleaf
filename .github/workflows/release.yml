@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Existing Cargo package version to publish to crates.io"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -27,14 +33,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Verify tag matches Cargo package version
+      - name: Verify release request matches Cargo package version
         shell: bash
         run: |
           set -euo pipefail
           package_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "jujuleaf") | .version')"
-          expected_tag="v${package_version}"
-          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
-            echo "release tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${package_version}" >&2
+          requested_version="${{ inputs.version }}"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            requested_version="${GITHUB_REF_NAME#v}"
+          fi
+          if [[ "${requested_version}" != "${package_version}" ]]; then
+            echo "requested version ${requested_version} does not match Cargo.toml version ${package_version}" >&2
             exit 1
           fi
 
@@ -45,9 +54,11 @@ jobs:
           cargo test --all-targets --locked
 
       - name: Build release binary
+        if: github.event_name == 'push'
         run: cargo build --release --locked --target "${TARGET}"
 
       - name: Package Linux AMD64 archive
+        if: github.event_name == 'push'
         shell: bash
         run: |
           set -euo pipefail
@@ -67,6 +78,7 @@ jobs:
           sha256sum "${asset_name}.tar.gz" > SHA256SUMS
 
       - name: Create GitHub Release
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
