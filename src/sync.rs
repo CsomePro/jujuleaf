@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{Cursor, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -10,12 +10,14 @@ use similar::TextDiff;
 
 use crate::api::OverleafApi;
 use crate::auth::{DEFAULT_PROFILE, Session};
+use crate::file_util::atomic_write;
 use crate::ignore;
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, DocumentState, build_document_operations, minimal_text_changes,
     parse_document_snapshot,
 };
+use crate::platform::{validate_materializable_paths, workspace_path};
 use crate::project::{FileRef, collect_entities, connect_project_with_api};
 use crate::socket::UpdateOptions;
 use crate::store::{AssetCheckpoint, SyncStore, bytes_hash, content_hash};
@@ -107,9 +109,7 @@ impl ProjectBinding {
 
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
-        std::fs::create_dir_all(path.parent().expect("binding has parent"))?;
-        std::fs::write(&path, serde_json::to_vec_pretty(self)?)
-            .with_context(|| format!("failed to write {}", path.display()))
+        atomic_write(&path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn load(root: &Path) -> Result<Self> {
@@ -124,15 +124,13 @@ impl ProjectBinding {
 
 fn save_project_context(root: &Path, project_id: &str) -> Result<()> {
     let path = root.join(PROJECT_CONTEXT_FILE);
-    std::fs::create_dir_all(path.parent().expect("context has parent"))?;
-    std::fs::write(
+    atomic_write(
         &path,
-        serde_json::to_vec_pretty(&ProjectContextManifest {
+        &serde_json::to_vec_pretty(&ProjectContextManifest {
             schema_version: 1,
             project_id: project_id.to_owned(),
         })?,
     )
-    .with_context(|| format!("failed to write {}", path.display()))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -337,14 +335,7 @@ fn save_conflict_manifest(root: &Path, manifest: &ConflictManifest) -> Result<()
         }
         return Ok(());
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(manifest)?)
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("failed to replace {}", path.display()))
+    atomic_write(&path, &serde_json::to_vec_pretty(manifest)?)
 }
 
 fn incoming_path(root: &Path, conflict: &StoredConflict) -> PathBuf {
@@ -436,18 +427,6 @@ fn find_conflict<'a>(manifest: &'a ConflictManifest, path: &str) -> Result<&'a S
     Ok(matches[0])
 }
 
-fn local_path(root: &Path, remote_path: &str) -> Result<PathBuf> {
-    let relative = Path::new(remote_path.trim_start_matches('/'));
-    ensure!(!relative.as_os_str().is_empty(), "remote path is empty");
-    ensure!(
-        relative
-            .components()
-            .all(|component| matches!(component, Component::Normal(_))),
-        "unsafe remote path: {remote_path}"
-    );
-    Ok(root.join(relative))
-}
-
 fn snapshot_metadata(state: &DocumentState) -> Value {
     if let Value::Object(mut object) = state.raw.clone() {
         object.remove("content");
@@ -468,13 +447,9 @@ fn metadata_parts(state: &DocumentState, ranges: &Value) -> Result<(Value, Strin
 
 fn save_metadata_manifest(root: &Path, manifest: &RemoteMetadataManifest) -> Result<()> {
     let path = root.join(METADATA_FILE);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let bytes = serde_json::to_vec_pretty(manifest)?;
     if std::fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("failed to write {}", path.display()))?;
+        atomic_write(&path, &bytes)?;
     }
     Ok(())
 }
@@ -492,6 +467,11 @@ fn zip_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut entries = BTreeMap::new();
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        ensure!(
+            !entry.name().contains('\\'),
+            "unsafe path in project zip: {}",
+            entry.name()
+        );
         if entry.is_dir() {
             continue;
         }
@@ -508,7 +488,7 @@ fn zip_entries(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>> {
 }
 
 fn read_binary(root: &Path, remote_path: &str) -> Result<Option<Vec<u8>>> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -518,7 +498,7 @@ fn read_binary(root: &Path, remote_path: &str) -> Result<Option<Vec<u8>>> {
 }
 
 fn write_binary(root: &Path, remote_path: &str, content: &[u8]) -> Result<()> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -678,7 +658,7 @@ pub fn discover_project_context(start: impl AsRef<Path>) -> Result<Option<Projec
 }
 
 fn write_document(root: &Path, remote_path: &str, content: &str) -> Result<()> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -686,7 +666,7 @@ fn write_document(root: &Path, remote_path: &str, content: &str) -> Result<()> {
 }
 
 fn read_document(root: &Path, remote_path: &str) -> Result<Option<String>> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -704,7 +684,7 @@ fn conflict_summaries(root: &Path, manifest: &ConflictManifest) -> Result<Vec<Co
                 kind: conflict.kind,
                 path: conflict.path.clone(),
                 remote_state: conflict.remote_state,
-                local_exists: local_path(root, &conflict.path)?.exists(),
+                local_exists: workspace_path(root, &conflict.path)?.exists(),
                 incoming_exists: incoming_path(root, conflict).exists(),
             })
         })
@@ -730,7 +710,7 @@ pub fn show_conflict(root: &Path, path: &str) -> Result<ConflictDetail> {
         conflict.project_id == binding.project_id,
         "conflict belongs to a different project"
     );
-    let local = std::fs::read(local_path(root, &conflict.path)?).ok();
+    let local = std::fs::read(workspace_path(root, &conflict.path)?).ok();
     let remote =
         match conflict.remote_state {
             ConflictRemoteState::Present => {
@@ -845,7 +825,7 @@ pub async fn resolve_conflict(
         }
         ConflictRemoteState::Deleted => None,
     };
-    let local = local_path(root, &conflict.path)?;
+    let local = workspace_path(root, &conflict.path)?;
     let (selected, resolution_name) = match &resolution {
         ConflictResolution::Ours => {
             (
@@ -969,11 +949,19 @@ fn extract_zip(bytes: &[u8], destination: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).context("invalid project zip")?;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
+        ensure!(
+            !entry.name().contains('\\'),
+            "unsafe path in project zip: {}",
+            entry.name()
+        );
         let relative = entry
             .enclosed_name()
             .ok_or_else(|| anyhow!("unsafe path in project zip: {}", entry.name()))?
             .to_owned();
-        let output = destination.join(relative);
+        let relative = relative
+            .to_str()
+            .ok_or_else(|| anyhow!("project zip path is not valid UTF-8: {}", entry.name()))?;
+        let output = workspace_path(destination, relative)?;
         if entry.is_dir() {
             std::fs::create_dir_all(&output)?;
             continue;
@@ -1007,10 +995,18 @@ pub async fn clone_project(
 
     let zip = api.download_zip(project_id).await?;
     let archive_entries = zip_entries(&zip)?;
-    extract_zip(&zip, destination)?;
+    validate_materializable_paths(archive_entries.keys().map(String::as_str))?;
 
     let (mut socket, project) = connect_project_with_api(api, project_id).await?;
     let entities = collect_entities(&project);
+    validate_materializable_paths(
+        entities
+            .documents
+            .iter()
+            .map(|document| document.path.as_str())
+            .chain(entities.files.iter().map(|file| file.path.as_str())),
+    )?;
+    extract_zip(&zip, destination)?;
     let documents = &entities.documents;
     let threads = api
         .threads(project_id)
@@ -1138,8 +1134,16 @@ pub async fn pull_project_with_api(
     let mut workspace = JjWorkspace::open(root).await?;
     workspace.checkpoint("local state before pull").await?;
     let archive_entries = zip_entries(&api.download_zip(&binding.project_id).await?)?;
+    validate_materializable_paths(archive_entries.keys().map(String::as_str))?;
     let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
     let entities = collect_entities(&project);
+    validate_materializable_paths(
+        entities
+            .documents
+            .iter()
+            .map(|document| document.path.as_str())
+            .chain(entities.files.iter().map(|file| file.path.as_str())),
+    )?;
     let threads = api
         .threads(&binding.project_id)
         .await
@@ -1222,9 +1226,9 @@ pub async fn pull_project_with_api(
             "conflict" => {
                 if let Some(previous_path) = relocated_from.as_deref() {
                     write_document(root, &document.path, local.as_deref().unwrap_or_default())?;
-                    std::fs::remove_file(local_path(root, previous_path)?).with_context(|| {
-                        format!("failed to remove relocated document {previous_path}")
-                    })?;
+                    std::fs::remove_file(workspace_path(root, previous_path)?).with_context(
+                        || format!("failed to remove relocated document {previous_path}"),
+                    )?;
                 }
                 let conflict = StoredConflict {
                     project_id: binding.project_id.clone(),
@@ -1261,7 +1265,7 @@ pub async fn pull_project_with_api(
                 &document.path,
             );
             if let Some(previous_path) = relocated_from {
-                std::fs::remove_file(local_path(root, &previous_path)?)?;
+                std::fs::remove_file(workspace_path(root, &previous_path)?)?;
             }
             accepted.push((
                 document.clone(),
@@ -1343,9 +1347,9 @@ pub async fn pull_project_with_api(
             "conflict" => {
                 if let Some(previous_path) = relocated_from.as_deref() {
                     write_binary(root, &file.path, local.as_deref().unwrap_or_default())?;
-                    std::fs::remove_file(local_path(root, previous_path)?).with_context(|| {
-                        format!("failed to remove relocated asset {previous_path}")
-                    })?;
+                    std::fs::remove_file(workspace_path(root, previous_path)?).with_context(
+                        || format!("failed to remove relocated asset {previous_path}"),
+                    )?;
                 }
                 let conflict = StoredConflict {
                     project_id: binding.project_id.clone(),
@@ -1377,7 +1381,7 @@ pub async fn pull_project_with_api(
                 &file.path,
             );
             if let Some(previous_path) = relocated_from {
-                std::fs::remove_file(local_path(root, &previous_path)?)?;
+                std::fs::remove_file(workspace_path(root, &previous_path)?)?;
             }
             accepted_assets.push((file.clone(), remote_hash, remote.len()));
         }
@@ -1408,7 +1412,7 @@ pub async fn pull_project_with_api(
                 binary_conflicts.push(path);
             }
             Some(_) => {
-                std::fs::remove_file(local_path(root, &previous.path)?)?;
+                std::fs::remove_file(workspace_path(root, &previous.path)?)?;
                 binary_deleted.push(previous.path.clone());
                 store.remove_asset(&binding.project_id, &previous.file_id)?;
                 clear_conflict(
@@ -1529,6 +1533,13 @@ pub async fn push_project_with_api(
     let checkpoint = workspace.checkpoint("local state before push").await?;
     let (mut socket, project) = connect_project_with_api(api, &binding.project_id).await?;
     let entities = collect_entities(&project);
+    validate_materializable_paths(
+        entities
+            .documents
+            .iter()
+            .map(|document| document.path.as_str())
+            .chain(entities.files.iter().map(|file| file.path.as_str())),
+    )?;
     let threads = api
         .threads(&binding.project_id)
         .await
@@ -1565,7 +1576,7 @@ pub async fn push_project_with_api(
             && let Some(previous_local) = read_document(root, &previous.path)?
         {
             write_document(root, &document.path, &previous_local)?;
-            std::fs::remove_file(local_path(root, &previous.path)?).with_context(|| {
+            std::fs::remove_file(workspace_path(root, &previous.path)?).with_context(|| {
                 format!("failed to remove relocated document {}", previous.path)
             })?;
             local = Some(previous_local);
@@ -1810,7 +1821,7 @@ pub async fn push_project_with_api(
             && let Some(previous_local) = read_binary(root, &previous.path)?
         {
             write_binary(root, &file.path, &previous_local)?;
-            std::fs::remove_file(local_path(root, &previous.path)?)
+            std::fs::remove_file(workspace_path(root, &previous.path)?)
                 .with_context(|| format!("failed to remove relocated asset {}", previous.path))?;
             local = Some(previous_local);
         }
@@ -1873,7 +1884,7 @@ pub async fn push_project_with_api(
             binary_conflicts.push(file.path.clone());
             continue;
         }
-        let path = local_path(root, &file.path)?;
+        let path = workspace_path(root, &file.path)?;
         match api
             .replace_file_protected(
                 &binding.project_id,
@@ -1948,7 +1959,7 @@ pub async fn push_project_with_api(
             binary_conflicts.push(path);
             continue;
         };
-        let local_file = local_path(root, &path)?;
+        let local_file = workspace_path(root, &path)?;
         match api
             .upload(&binding.project_id, folder_id, &local_file, name)
             .await
@@ -2386,8 +2397,8 @@ mod tests {
     #[test]
     fn unsafe_remote_paths_never_escape_the_clone() {
         let temp = tempfile::tempdir().unwrap();
-        assert!(local_path(temp.path(), "../outside").is_err());
-        assert!(local_path(temp.path(), "/safe/file.png").is_ok());
+        assert!(workspace_path(temp.path(), "../outside").is_err());
+        assert!(workspace_path(temp.path(), "/safe/file.png").is_ok());
     }
 
     #[test]

@@ -29,8 +29,8 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 > [!IMPORTANT]
 > JujuLeaf 仍处于 1.0 之前的早期阶段，并依赖 Overleaf 私有 API。请先在非关键
-> 项目中试用，或提前保留备份。v0.1.3 暂时只提供静态链接的 Linux AMD64
-> 预编译版本。
+> 项目中试用，或提前保留备份。v0.1.4-rc.1 是跨平台预览版；当前稳定版
+> v0.1.3 仍只提供 Linux AMD64 预编译文件。
 
 ## 为什么使用 JujuLeaf？
 
@@ -49,31 +49,43 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 ### cargo-binstall（推荐）
 
-安装 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) 后，可以
-直接从 GitHub Releases 下载官方预编译版本：
+安装 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) 后，可安装当前
+稳定版：
 
 ~~~bash
 cargo binstall --strategies crate-meta-data jujuleaf
 ~~~
 
-在无人值守环境中可增加 --no-confirm。预编译版本目前支持 Linux AMD64，
-并且不依赖宿主机的 glibc 版本。
+稳定版 v0.1.3 的预编译文件面向 Linux AMD64，并采用完全静态链接，不依赖宿主机
+的 glibc 版本。无人值守环境可增加 `--no-confirm`。
 
-### 手动下载 Linux AMD64 版本
+### 试用 v0.1.4 跨平台预览版
 
-从 [最新 Release](https://github.com/CsomePro/jujuleaf/releases/latest)
-下载压缩包和校验文件，或者直接安装 v0.1.3：
+指定版本即可安装或升级到本次候选版本：
 
 ~~~bash
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/SHA256SUMS
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
-install -Dm755 jujuleaf-v0.1.3-x86_64-unknown-linux-musl/jujuleaf ~/.local/bin/jujuleaf
+cargo binstall --strategies crate-meta-data --force jujuleaf@0.1.4-rc.1
 jujuleaf --version
 ~~~
 
-请确认 ~/.local/bin 已加入 PATH。
+cargo-binstall 会自动选择与当前系统匹配的文件：
+
+| 平台 | 架构 | Rust target | 发布格式 |
+| --- | --- | --- | --- |
+| Linux | AMD64 | `x86_64-unknown-linux-musl` | 完全静态的 `.tar.gz` |
+| Linux | ARM64 | `aarch64-unknown-linux-musl` | 完全静态的 `.tar.gz` |
+| macOS | Apple Silicon | `aarch64-apple-darwin` | 单二进制 `.tar.gz` |
+| macOS | Intel | `x86_64-apple-darwin` | 单二进制 `.tar.gz` |
+| Windows | AMD64 | `x86_64-pc-windows-msvc` | 静态 CRT 的 `.zip` |
+
+macOS 版本只依赖 Apple 系统库，Windows 版本只依赖 Windows 系统库；两者均无需
+额外安装 `jj`、Git、OpenSSL 或 SQLite。
+
+### 手动下载
+
+从 [v0.1.4-rc.1 预发布页面](https://github.com/CsomePro/jujuleaf/releases/tag/v0.1.4-rc.1)
+下载对应 target 的压缩包和 `SHA256SUMS`。Linux 与 macOS 压缩包内是
+`jujuleaf`，Windows ZIP 内是 `jujuleaf.exe`；将它放入 `PATH` 中的目录即可。
 
 ### 从源码安装
 
@@ -319,7 +331,7 @@ jujuleaf conflict list
 jujuleaf conflict show main.tex
 jujuleaf conflict resolve main.tex --ours
 jujuleaf conflict resolve main.tex --theirs
-jujuleaf conflict resolve main.tex --merged /tmp/main.tex
+jujuleaf conflict resolve main.tex --merged ./main.merged.tex
 ~~~
 
 `--ours` 保留本地文件，`--theirs` 接受已保存的远端副本，`--merged` 使用你准备
@@ -404,8 +416,9 @@ Cookie；`auth logout` 会删除所选本地 profile 及其凭据。
 
 ## 当前限制
 
-- Release 暂时只提供 Linux AMD64 预编译版本，其他平台可以从源码构建。
-- 浏览器登录需要 Chrome 或 Chromium；也可以直接提供已有的会话 Cookie。
+- v0.1.4-rc.1 是首个 macOS、Windows 和 Linux ARM64 预览版；建议先在非关键
+  项目中使用，并反馈平台相关问题。
+- 浏览器登录需要 Chrome、Chromium 或 Edge；也可以直接提供已有的会话 Cookie。
 - 同步只在前台运行，目前没有后台服务。
 - Overleaf 私有 API 可能随时变化，自托管实例尤其如此。
 

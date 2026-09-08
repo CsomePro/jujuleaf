@@ -29,8 +29,8 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 > [!IMPORTANT]
 > JujuLeaf is pre-1.0 software built on private Overleaf APIs. Start with a
-> non-critical project or keep a backup. Version 0.1.3 provides a statically
-> linked prebuilt binary for Linux AMD64 only.
+> non-critical project or keep a backup. v0.1.4-rc.1 is a cross-platform preview;
+> the current stable v0.1.3 release provides a Linux AMD64 binary only.
 
 ## Why JujuLeaf?
 
@@ -52,31 +52,45 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 ### cargo-binstall (recommended)
 
 With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall) installed,
-download the official prebuilt binary from GitHub Releases:
+install the current stable release:
 
 ~~~bash
 cargo binstall --strategies crate-meta-data jujuleaf
 ~~~
 
-For unattended environments, add --no-confirm. The prebuilt release currently
-supports Linux AMD64 and does not depend on the host's glibc version.
+The stable v0.1.3 binary targets Linux AMD64 and is fully static, so it does not
+depend on the host's glibc version. For unattended environments, add
+`--no-confirm`.
 
-### Manual Linux AMD64 download
+### Try the v0.1.4 cross-platform preview
 
-Download the archive and checksum from the
-[latest release](https://github.com/CsomePro/jujuleaf/releases/latest), or
-install version 0.1.3 directly:
+Install or upgrade specifically to the release candidate:
 
 ~~~bash
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/SHA256SUMS
-sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
-install -Dm755 jujuleaf-v0.1.3-x86_64-unknown-linux-musl/jujuleaf ~/.local/bin/jujuleaf
+cargo binstall --strategies crate-meta-data --force jujuleaf@0.1.4-rc.1
 jujuleaf --version
 ~~~
 
-Make sure ~/.local/bin is on your PATH.
+cargo-binstall automatically selects the matching archive:
+
+| Platform | Architecture | Rust target | Package |
+| --- | --- | --- | --- |
+| Linux | AMD64 | `x86_64-unknown-linux-musl` | Fully static `.tar.gz` |
+| Linux | ARM64 | `aarch64-unknown-linux-musl` | Fully static `.tar.gz` |
+| macOS | Apple Silicon | `aarch64-apple-darwin` | Single-binary `.tar.gz` |
+| macOS | Intel | `x86_64-apple-darwin` | Single-binary `.tar.gz` |
+| Windows | AMD64 | `x86_64-pc-windows-msvc` | Static-CRT `.zip` |
+
+macOS binaries use Apple system libraries, and the Windows executable uses
+Windows system libraries. No separate `jj`, Git, OpenSSL, or SQLite installation
+is required.
+
+### Manual download
+
+Download the archive for your target and `SHA256SUMS` from the
+[v0.1.4-rc.1 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.1.4-rc.1).
+Linux and macOS archives contain `jujuleaf`; the Windows ZIP contains
+`jujuleaf.exe`. Put that executable in a directory on your `PATH`.
 
 ### Build from source
 
@@ -336,7 +350,7 @@ jujuleaf conflict list
 jujuleaf conflict show main.tex
 jujuleaf conflict resolve main.tex --ours
 jujuleaf conflict resolve main.tex --theirs
-jujuleaf conflict resolve main.tex --merged /tmp/main.tex
+jujuleaf conflict resolve main.tex --merged ./main.merged.tex
 ~~~
 
 `--ours` keeps the local file, `--theirs` accepts the preserved remote copy,
@@ -432,10 +446,10 @@ offline form skips the network check. `auth status` never prints the cookie;
 
 ## Current limitations
 
-- The ready-made release currently targets Linux AMD64. Other platforms can
-  build from source.
-- Browser login requires Chrome or Chromium, unless an existing session cookie
-  is supplied.
+- v0.1.4-rc.1 is the first macOS, Windows, and Linux ARM64 preview; use it first
+  on a non-critical project and report platform-specific issues.
+- Browser login requires Chrome, Chromium, or Edge, unless an existing session
+  cookie is supplied.
 - Synchronization is foreground-only; there is no background service.
 - Overleaf private APIs may change without notice, especially on self-hosted
   installations.

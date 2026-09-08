@@ -1,6 +1,6 @@
 [package]
 name = "jujuleaf"
-version = "0.1.3"
+version = "0.1.4-rc.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Local-first Overleaf collaboration powered by Jujutsu"
@@ -19,6 +19,17 @@ pkg-fmt = "tgz"
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-x86_64-unknown-linux-musl.tar.gz"
 bin-dir = "{ name }-v{ version }-x86_64-unknown-linux-musl/{ bin }"
+
+# Apply the same glibc-independent mapping on 64-bit ARM Linux hosts.
+[package.metadata.binstall.overrides.aarch64-unknown-linux-gnu]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-aarch64-unknown-linux-musl.tar.gz"
+bin-dir = "{ name }-v{ version }-aarch64-unknown-linux-musl/{ bin }"
+
+# Windows releases use a native ZIP archive and include the executable suffix.
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-v{ version }-{ target }.zip"
+bin-dir = "{ name }-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "zip"
 
 [dependencies]
 anstyle = "1"

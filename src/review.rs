@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
@@ -8,11 +8,13 @@ use serde_json::{Value, json};
 
 use crate::api::OverleafApi;
 use crate::auth::Session;
+use crate::file_util::atomic_write;
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, DocumentState, HISTORY_OT, build_document_operations, minimal_text_changes,
     parse_document_snapshot, utf16_len,
 };
+use crate::platform::workspace_path;
 use crate::project::{DocumentRef, collect_entities, connect_project_with_api};
 use crate::socket::UpdateOptions;
 use crate::store::{OperationStatus, SyncStore, bytes_hash, content_hash};
@@ -192,26 +194,14 @@ fn database(root: &Path) -> Result<SyncStore> {
     SyncStore::open(root.join(STATE_DIR).join("sync.sqlite3"))
 }
 
-fn local_path(root: &Path, remote_path: &str) -> Result<PathBuf> {
-    let relative = Path::new(remote_path.trim_start_matches('/'));
-    ensure!(!relative.as_os_str().is_empty(), "remote path is empty");
-    ensure!(
-        relative
-            .components()
-            .all(|component| matches!(component, Component::Normal(_))),
-        "unsafe remote path: {remote_path}"
-    );
-    Ok(root.join(relative))
-}
-
 fn read_document(root: &Path, remote_path: &str) -> Result<String> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     std::fs::read_to_string(&path)
         .with_context(|| format!("failed to read UTF-8 document {}", path.display()))
 }
 
 fn write_document(root: &Path, remote_path: &str, content: &str) -> Result<()> {
-    let path = local_path(root, remote_path)?;
+    let path = workspace_path(root, remote_path)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -294,13 +284,7 @@ fn require_state(root: &Path) -> Result<ReviewState> {
 
 fn save_state(root: &Path, state: &ReviewState) -> Result<()> {
     let path = review_path(root);
-    let parent = path.parent().expect("review state has parent");
-    std::fs::create_dir_all(parent)?;
-    let temporary = parent.join("review.json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(state)?)
-        .with_context(|| format!("failed to write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("failed to replace {}", path.display()))
+    atomic_write(&path, &serde_json::to_vec_pretty(state)?)
 }
 
 fn clear_state(root: &Path) -> Result<()> {

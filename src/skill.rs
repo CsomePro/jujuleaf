@@ -17,9 +17,9 @@ use dialoguer::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 
 use crate::auth::ProfileStore;
+use crate::file_util::atomic_write;
 use crate::output::{OutputMode, output};
 
 const EMBEDDED_SKILL: &str = include_str!("../skill/SKILL.md");
@@ -60,7 +60,7 @@ pub struct SkillRenderArgs {
     #[arg(long, value_enum, default_value_t = SkillAgent::Portable)]
     agent: SkillAgent,
 
-    /// Exact destination directory, for example /tmp/jujuleaf.
+    /// Exact destination directory for rendered Skill files.
     #[arg(long, value_name = "SKILL_DIR")]
     output: Option<PathBuf>,
 
@@ -553,11 +553,17 @@ fn validate_embedded_bundle() -> Result<SkillManifest> {
 }
 
 fn parse_frontmatter(source: &str) -> Result<(BTreeMap<String, Value>, &str)> {
-    let source = source
+    let (source, separator) = source
         .strip_prefix("---\n")
+        .map(|source| (source, "\n---\n"))
+        .or_else(|| {
+            source
+                .strip_prefix("---\r\n")
+                .map(|source| (source, "\r\n---\r\n"))
+        })
         .ok_or_else(|| anyhow!("embedded SKILL.md must start with YAML frontmatter"))?;
     let (header, body) = source
-        .split_once("\n---\n")
+        .split_once(separator)
         .ok_or_else(|| anyhow!("embedded SKILL.md frontmatter is not terminated"))?;
     let mut fields = BTreeMap::new();
     for line in header.lines() {
@@ -1643,26 +1649,6 @@ fn save_registry(path: &Path, registry: &Registry) -> Result<()> {
     atomic_write(path, &bytes)
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} does not have a parent directory", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .with_context(|| format!("failed to create a temporary file in {}", parent.display()))?;
-    temporary
-        .write_all(bytes)
-        .with_context(|| format!("failed to write temporary file for {}", path.display()))?;
-    temporary
-        .flush()
-        .with_context(|| format!("failed to flush temporary file for {}", path.display()))?;
-    temporary
-        .persist(path)
-        .map_err(|error| error.error)
-        .with_context(|| format!("failed to atomically replace {}", path.display()))?;
-    Ok(())
-}
-
 fn file_digest(path: &Path) -> Result<String> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
@@ -2084,6 +2070,14 @@ mod tests {
         let manifest = validate_embedded_bundle().unwrap();
         assert_eq!(manifest.skill_version, "0.1.0");
         assert!(EMBEDDED_SKILL.len() + EMBEDDED_MANIFEST.len() < 64 * 1024);
+    }
+
+    #[test]
+    fn frontmatter_accepts_crlf_line_endings() {
+        let source = "---\r\nname: jujuleaf\r\ndescription: test\r\n---\r\n# Body\r\n";
+        let (fields, body) = parse_frontmatter(source).unwrap();
+        assert_eq!(fields["name"], "jujuleaf");
+        assert_eq!(body, "# Body\r\n");
     }
 
     #[test]

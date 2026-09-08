@@ -12,33 +12,25 @@ on:
         type: string
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.event_name }}-${{ github.ref_name || inputs.version }}
   cancel-in-progress: false
 
 jobs:
-  release-linux-amd64:
-    name: Release Linux AMD64
-    runs-on: ubuntu-latest
-    env:
-      TARGET: x86_64-unknown-linux-musl
-
+  prepare:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.package.outputs.version }}
     steps:
       - uses: actions/checkout@v7
-
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
-          components: rustfmt, clippy
-          targets: x86_64-unknown-linux-musl
-
-      - name: Install musl build tools
-        if: github.event_name == 'push'
-        run: sudo apt-get update && sudo apt-get install --yes musl-tools
-
+          components: rustfmt
       - name: Verify release request matches Cargo package version
+        id: package
         shell: bash
         run: |
           set -euo pipefail
@@ -51,65 +43,205 @@ jobs:
             echo "requested version ${requested_version} does not match Cargo.toml version ${package_version}" >&2
             exit 1
           fi
+          echo "version=${package_version}" >> "${GITHUB_OUTPUT}"
+      - run: cargo fmt --all -- --check
 
-      - name: Run quality checks
+  build:
+    name: Build · ${{ matrix.name }}
+    if: github.event_name == 'push'
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AMD64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            rustflags: ""
+          - name: Linux ARM64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            rustflags: ""
+          - name: macOS Apple Silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+            rustflags: ""
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            rustflags: ""
+          - name: Windows AMD64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            rustflags: "-C target-feature=+crt-static"
+    runs-on: ${{ matrix.os }}
+    env:
+      TARGET: ${{ matrix.target }}
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.92.0
+        with:
+          components: clippy
+          targets: ${{ matrix.target }}
+
+      - name: Install musl build tools
+        if: contains(matrix.target, 'linux-musl')
+        shell: bash
         run: |
-          cargo fmt --all -- --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo test --all-targets --locked
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+          target_env="${TARGET//-/_}"
+          echo "CC_${target_env}=musl-gcc" >> "${GITHUB_ENV}"
+          echo "CARGO_TARGET_${target_env^^}_LINKER=musl-gcc" >> "${GITHUB_ENV}"
+
+      - name: Run target checks
+        run: |
+          cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+          cargo test --all-targets --locked --target ${{ matrix.target }}
 
       - name: Build release binary
-        if: github.event_name == 'push'
-        run: cargo build --release --locked --target "${TARGET}"
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package Linux AMD64 archive
-        if: github.event_name == 'push'
+      - name: Verify static Windows CRT
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $cfg = rustc --target "$env:TARGET" -C target-feature=+crt-static --print cfg
+          if ($cfg -notcontains 'target_feature="crt-static"') {
+            throw "MSVC static CRT is not enabled"
+          }
+
+      - name: Package Unix archive
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           asset_name="jujuleaf-${GITHUB_REF_NAME}-${TARGET}"
           asset_dir="dist/${asset_name}"
 
-          mkdir -p "${asset_dir}"
-          strip "target/${TARGET}/release/jujuleaf"
-          install -m 0755 "target/${TARGET}/release/jujuleaf" "${asset_dir}/jujuleaf"
-          install -m 0644 README.md README.zh.md LICENSE "${asset_dir}/"
-          install -d -m 0755 "${asset_dir}/assets"
-          install -m 0644 assets/jujuleaf-logo.png "${asset_dir}/assets/"
-          if readelf -l "${asset_dir}/jujuleaf" | grep -q INTERP; then
-            echo "release binary unexpectedly contains a dynamic interpreter" >&2
-            exit 1
+          mkdir -p "${asset_dir}/assets"
+          cp "target/${TARGET}/release/jujuleaf" "${asset_dir}/jujuleaf"
+          chmod 0755 "${asset_dir}/jujuleaf"
+          cp README.md README.zh.md LICENSE "${asset_dir}/"
+          cp assets/jujuleaf-logo.png "${asset_dir}/assets/"
+
+          if [[ "${TARGET}" == *-linux-musl ]]; then
+            if readelf -l "${asset_dir}/jujuleaf" | grep -q INTERP; then
+              echo "Linux release binary unexpectedly contains a dynamic interpreter" >&2
+              exit 1
+            fi
+          else
+            non_system="$(otool -L "${asset_dir}/jujuleaf" | tail -n +2 | grep -Ev '^[[:space:]]+(/usr/lib/|/System/Library/)' || true)"
+            if [[ -n "${non_system}" ]]; then
+              echo "macOS release links a non-system library:" >&2
+              echo "${non_system}" >&2
+              exit 1
+            fi
           fi
+
           "${asset_dir}/jujuleaf" --version
-
           tar -C dist -czf "dist/${asset_name}.tar.gz" "${asset_name}"
-          cd dist
-          sha256sum "${asset_name}.tar.gz" > SHA256SUMS
 
+      - name: Package Windows archive
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $assetName = "jujuleaf-$env:GITHUB_REF_NAME-$env:TARGET"
+          $assetDir = "dist\$assetName"
+          New-Item -ItemType Directory -Force "$assetDir\assets" | Out-Null
+          Copy-Item "target\$env:TARGET\release\jujuleaf.exe" "$assetDir\jujuleaf.exe"
+          Copy-Item README.md, README.zh.md, LICENSE $assetDir
+          Copy-Item assets\jujuleaf-logo.png "$assetDir\assets\"
+          & "$assetDir\jujuleaf.exe" --version
+          Compress-Archive -Path $assetDir -DestinationPath "dist\$assetName.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub prerelease
+    if: github.event_name == 'push'
+    needs: [prepare, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
       - name: Create GitHub Release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          asset_name="jujuleaf-${GITHUB_REF_NAME}-${TARGET}"
+          set -euo pipefail
           notes_file=".github/release-${GITHUB_REF_NAME}.md"
           notes_args=(--generate-notes)
           if [[ -f "${notes_file}" ]]; then
             notes_args=(--notes-file "${notes_file}")
           fi
-
-          gh release create "${GITHUB_REF_NAME}" \
-            "dist/${asset_name}.tar.gz#Linux AMD64 static binary" \
-            "dist/SHA256SUMS#SHA-256 checksums" \
+          release_args=()
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            release_args+=(--prerelease)
+          fi
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
+          gh release create "${GITHUB_REF_NAME}" "${assets[@]}" \
             --verify-tag \
             --fail-on-no-commits \
             "${notes_args[@]}" \
+            "${release_args[@]}" \
             --title "JujuLeaf ${GITHUB_REF_NAME}"
 
+  publish:
+    name: Publish crate
+    if: github.event_name == 'push'
+    needs: [prepare, release]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.92.0
       - name: Authenticate with crates.io
         id: crates_io_auth
         uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate to crates.io
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates_io_auth.outputs.token }}
 
+  publish-retry:
+    name: Retry crates.io publish
+    if: github.event_name == 'workflow_dispatch'
+    needs: prepare
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - name: Authenticate with crates.io
+        id: crates_io_auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish crate to crates.io
         run: cargo publish --locked
         env:

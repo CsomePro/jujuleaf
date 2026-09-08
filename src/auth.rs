@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -432,30 +433,94 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
 }
 
 pub fn find_chrome() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::<PathBuf>::new();
     #[cfg(target_os = "linux")]
-    candidates.extend([
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/snap/bin/chromium",
-    ]);
+    candidates.extend(
+        [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/chromium",
+            "/snap/bin/chromium",
+        ]
+        .map(PathBuf::from),
+    );
     #[cfg(target_os = "macos")]
-    candidates.extend([
-        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-        "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
-        "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    ]);
+    candidates.extend(
+        [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .map(PathBuf::from),
+    );
     #[cfg(target_os = "windows")]
-    candidates.extend([
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ]);
+    candidates.extend(
+        [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ]
+        .map(PathBuf::from),
+    );
+    #[cfg(target_os = "macos")]
+    if let Some(home) = env::var_os("HOME") {
+        candidates.extend(
+            [
+                "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+                "Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+            .map(|relative| PathBuf::from(&home).join(relative)),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        for variable in ["PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"] {
+            let Some(root) = env::var_os(variable) else {
+                continue;
+            };
+            for relative in [
+                "Google/Chrome/Application/chrome.exe",
+                "Chromium/Application/chromium.exe",
+                "Microsoft/Edge/Application/msedge.exe",
+            ] {
+                candidates.push(PathBuf::from(&root).join(relative));
+            }
+        }
+    }
+
     candidates
         .into_iter()
-        .map(PathBuf::from)
-        .find(|path| path.exists())
+        .find(|path| path.is_file())
+        .or_else(|| {
+            executable_on_path(&[
+                "google-chrome",
+                "google-chrome-stable",
+                "chromium",
+                "chromium-browser",
+                "chrome",
+                "msedge",
+                "chrome.exe",
+                "chromium.exe",
+                "msedge.exe",
+            ])
+        })
+}
+
+fn executable_on_path(names: &[&str]) -> Option<PathBuf> {
+    let search_path = env::var_os("PATH")?;
+    for directory in env::split_paths(&search_path) {
+        for name in names {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 async fn wait_for_devtools_port(profile: &Path, child: &mut Child) -> Result<u16> {
@@ -590,7 +655,7 @@ fn is_authenticated_page(state: &Value, base_url: &str, success_path: &str) -> b
 
 pub async fn interactive_login(base_url: &str, preset: LoginPreset) -> Result<String> {
     let chrome = find_chrome().ok_or_else(|| {
-        anyhow!("Chrome/Chromium not found; use: jujuleaf login --cookie \"...\"")
+        anyhow!("Chrome, Chromium, or Edge not found; use: jujuleaf login --cookie \"...\"")
     })?;
     let profile = tempfile::tempdir().context("failed to create temporary Chrome profile")?;
     let login_url = format!("{}{}", base_url.trim_end_matches('/'), preset.login_path());
