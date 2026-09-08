@@ -29,6 +29,7 @@ use crate::review::{
     abort_review, begin_review, ensure_sync_allowed, finish_review_with_api, review_diff_with_api,
     review_status_with_api, submit_review_with_api,
 };
+use crate::skill::{self, SkillCommand};
 use crate::socket::UpdateOptions;
 use crate::sync::{
     ConflictResolution, ProjectBinding, WorkspaceOperationLock, clone_project,
@@ -269,7 +270,7 @@ fn prepare_cli_args(
         });
     };
     let Some(shape) = project_argument_shape(command) else {
-        let context_profile = if command == "bridge" {
+        let context_profile = if matches!(command, "bridge" | "skill") {
             None
         } else {
             discover_project_context(current_dir)?.and_then(|context| context.profile)
@@ -393,6 +394,11 @@ enum Command {
     Bridge {
         #[command(subcommand)]
         command: BridgeCommand,
+    },
+    /// Install, inspect, update, or remove the embedded Agent Skill.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
     /// List Overleaf projects.
     #[command(visible_alias = "ls-projects")]
@@ -1711,6 +1717,7 @@ pub async fn run() -> Result<()> {
     let explicit_profile = cli.profile;
     let project_override = cli.project;
     match cli.command {
+        Command::Skill { command } => skill::run(command, &current_dir, pretty),
         Command::Bridge { command } => {
             bridge::run(
                 command,
@@ -2480,6 +2487,7 @@ async fn dispatch_authenticated(
         | Command::Auth { .. }
         | Command::Doctor { .. }
         | Command::Bridge { .. }
+        | Command::Skill { .. }
         | Command::Conflict { .. }
         | Command::Local { .. }
         | Command::Git { .. }
@@ -2963,6 +2971,33 @@ mod tests {
         Cli::try_parse_from(["jujuleaf", "bridge", "describe"]).unwrap();
         Cli::try_parse_from(["jujuleaf", "bridge", "comments", "list"]).unwrap();
         Cli::try_parse_from(["jujuleaf", "bridge", "comments", "watch"]).unwrap();
+    }
+
+    #[test]
+    fn skill_commands_support_interactive_and_direct_installation() {
+        Cli::try_parse_from(["jujuleaf", "skill", "install"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "skill",
+            "install",
+            "--agent",
+            "codex,kimi-code",
+            "--scope",
+            "project",
+            "--yes",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Skill {
+                command: SkillCommand::Install(_)
+            }
+        ));
+
+        Cli::try_parse_from(["jujuleaf", "skill", "detect"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "skill", "status", "--all"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "skill", "update", "--all", "--yes"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "skill", "uninstall", "--all", "--yes"]).unwrap();
     }
 
     #[test]

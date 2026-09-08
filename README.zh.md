@@ -81,6 +81,50 @@ JujuLeaf 需要 Rust 1.92 或更高版本：
 cargo install --locked jujuleaf
 ~~~
 
+## 安装 Agent Skill
+
+JujuLeaf 可执行文件内嵌了一份带版本、自描述的 Agent Skill。运行下面的命令会
+进入终端引导界面：它会检测本机已有的 Agent 命令与配置目录，先选择安装到
+项目根目录、当前目录、用户全局目录或自定义目录，再多选 Agent 目标：
+
+~~~bash
+jujuleaf skill install
+~~~
+
+使用 ↑/↓ 移动、Space 切换选择、Enter 确认、Esc 取消。最终确认时使用
+←/→ 选择、Enter 确认，也可以直接按 `y` 或 `n`。
+
+目前支持 Codex、Claude Code、Kimi Code CLI、Pi、Gemini CLI、GitHub
+Copilot、Cursor、OpenCode，以及通用的 `.agents/skills` 约定。安装器会写入
+各 Agent 的原生目录，但所有目标共用一份标准 `SKILL.md`；Codex 会额外得到
+可选的 `agents/openai.yaml` 界面配置。
+
+交互界面的所有选择都有对应参数，方便脚本或无人值守环境使用：
+
+~~~bash
+# 在最近的项目根目录中为两个 Agent 安装。
+jujuleaf skill install --agent codex,claude-code --scope project --yes
+
+# 写入当前目录下各 Agent 的原生配置目录。
+jujuleaf skill install --agent kimi-code --scope current --yes
+
+# 把另一个目录作为共享的 skills 根目录。
+jujuleaf skill install --agent portable --to ./agent-skills --yes
+~~~
+
+可以查看检测结果，并管理 JujuLeaf 记录的全部安装位置：
+
+~~~bash
+jujuleaf skill detect
+jujuleaf skill status
+jujuleaf skill update
+jujuleaf skill uninstall
+~~~
+
+更新前会比较文件摘要；如果用户改过已安装的 Skill，JujuLeaf 默认拒绝覆盖。
+显式增加 `--force` 时会先创建带时间戳的备份。自动化调用可结合 `--raw`、
+完整目标参数、`--yes`，以及可选的 `--dry-run`。
+
 ## 快速开始
 
 先登录、找到项目 ID，再克隆到一个新目录或空目录：
@@ -162,6 +206,7 @@ JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告�
 | 提交一处修订 | <code>jujuleaf suggest main.tex --old "草稿" --new "终稿"</code> |
 | 查看评论线程 | <code>jujuleaf threads</code> |
 | 接入外部 worker | <code>jujuleaf bridge describe</code>、<code>jujuleaf bridge comments watch</code> |
+| 安装或更新 Agent Skill | <code>jujuleaf skill install</code>、<code>jujuleaf skill update</code> |
 | 编译并查看诊断 | <code>jujuleaf compile</code> |
 | 下载编译后的 PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | 比较本地与远端状态 | <code>jujuleaf status</code> |

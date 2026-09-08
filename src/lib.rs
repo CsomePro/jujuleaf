@@ -10,6 +10,7 @@ pub mod operations;
 pub mod output;
 pub mod project;
 pub mod review;
+pub mod skill;
 pub mod socket;
 pub mod store;
 pub mod sync;

@@ -388,7 +388,23 @@ fn describe() -> Value {
                 ]
             },
             "threadContext": {"versions": [1], "multipleAnchors": true},
-            "skillInstall": {"targets": []}
+            "skillInstall": {
+                "versions": [1],
+                "targets": [
+                    "portable",
+                    "codex",
+                    "claude-code",
+                    "kimi-code",
+                    "pi",
+                    "gemini-cli",
+                    "github-copilot",
+                    "cursor",
+                    "opencode"
+                ],
+                "scopes": ["project", "current", "user", "custom"],
+                "interactive": true,
+                "managedUpdates": true
+            }
         },
         "errors": [
             "JUJULEAF_NOT_INITIALIZED",

@@ -86,6 +86,53 @@ JujuLeaf requires Rust 1.92 or newer:
 cargo install --locked jujuleaf
 ~~~
 
+## Install the Agent Skill
+
+The executable contains a versioned, self-describing Agent Skill bundle. Run the
+guided terminal installer to detect local Agent commands and configuration
+directories, choose a project, current-directory, user, or custom installation,
+and then select one or more targets:
+
+~~~bash
+jujuleaf skill install
+~~~
+
+Use ↑/↓ to move, Space to toggle targets, Enter to confirm, and Esc to cancel.
+For the final confirmation, use ←/→ to choose, Enter to accept, or `y`/`n`
+directly.
+
+JujuLeaf supports Codex, Claude Code, Kimi Code CLI, Pi, Gemini CLI, GitHub
+Copilot, Cursor, OpenCode, and the portable `.agents/skills` convention. It
+writes each Agent's native directory, while keeping one standard `SKILL.md`
+source. Codex also receives its optional `agents/openai.yaml` interface file.
+
+Every choice is available as an argument for scripts and unattended setup:
+
+~~~bash
+# Install for two Agents in the nearest project root.
+jujuleaf skill install --agent codex,claude-code --scope project --yes
+
+# Install in native Agent directories under the current directory.
+jujuleaf skill install --agent kimi-code --scope current --yes
+
+# Treat another directory as a shared skills root.
+jujuleaf skill install --agent portable --to ./agent-skills --yes
+~~~
+
+Inspect detected Agents and manage every registered installation:
+
+~~~bash
+jujuleaf skill detect
+jujuleaf skill status
+jujuleaf skill update
+jujuleaf skill uninstall
+~~~
+
+Updates compare file digests before writing. JujuLeaf refuses to overwrite local
+changes unless `--force` is supplied, in which case it creates a timestamped
+backup first. Use `--raw`, explicit target arguments, `--yes`, and optionally
+`--dry-run` for non-interactive automation.
+
 ## Quick start
 
 Sign in, find a project, and clone it into a new or empty directory:
@@ -168,6 +215,7 @@ foreign or partially resolved changes before closing it.
 | Submit one tracked edit | <code>jujuleaf suggest main.tex --old "draft" --new "final"</code> |
 | View comment threads | <code>jujuleaf threads</code> |
 | Integrate an external worker | <code>jujuleaf bridge describe</code>, <code>jujuleaf bridge comments watch</code> |
+| Install or update the Agent Skill | <code>jujuleaf skill install</code>, <code>jujuleaf skill update</code> |
 | Compile and inspect diagnostics | <code>jujuleaf compile</code> |
 | Download the compiled PDF | <code>jujuleaf pdf -o paper.pdf</code> |
 | Compare local and remote state | <code>jujuleaf status</code> |

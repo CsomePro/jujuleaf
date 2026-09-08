@@ -1,0 +1,27 @@
+{
+  "schema": "jujuleaf.skill",
+  "schemaVersion": 1,
+  "skillVersion": "0.1.0",
+  "minimumJujuleafVersion": "0.1.1",
+  "entrypoint": "SKILL.md",
+  "invocation": {
+    "implicit": true,
+    "userInvocable": true
+  },
+  "interface": {
+    "displayName": "JujuLeaf",
+    "shortDescription": "Work safely with Overleaf through JujuLeaf",
+    "defaultPrompt": "Use $jujuleaf to work safely with this Overleaf project."
+  },
+  "targets": [
+    "portable",
+    "codex",
+    "claude-code",
+    "kimi-code",
+    "pi",
+    "gemini-cli",
+    "github-copilot",
+    "cursor",
+    "opencode"
+  ]
+}
