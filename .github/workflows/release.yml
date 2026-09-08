@@ -57,11 +57,11 @@ jobs:
           - name: Linux AMD64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
-            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-static"
+            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes"
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes -C link-arg=-static"
+            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes"
           - name: macOS Apple Silicon
             os: macos-14
             target: aarch64-apple-darwin
@@ -94,7 +94,6 @@ jobs:
           sudo apt-get install --yes musl-tools
           target_env="${TARGET//-/_}"
           echo "CC_${target_env}=musl-gcc" >> "${GITHUB_ENV}"
-          echo "CARGO_TARGET_${target_env^^}_LINKER=musl-gcc" >> "${GITHUB_ENV}"
 
       - name: Run target lint
         run: cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
