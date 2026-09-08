@@ -29,8 +29,8 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 > [!IMPORTANT]
 > JujuLeaf is pre-1.0 software built on private Overleaf APIs. Start with a
-> non-critical project or keep a backup. Version 0.1.2 currently provides a
-> prebuilt binary for Linux AMD64 only.
+> non-critical project or keep a backup. Version 0.1.3 provides a statically
+> linked prebuilt binary for Linux AMD64 only.
 
 ## Why JujuLeaf?
 
@@ -59,20 +59,20 @@ cargo binstall --strategies crate-meta-data jujuleaf
 ~~~
 
 For unattended environments, add --no-confirm. The prebuilt release currently
-supports Linux AMD64.
+supports Linux AMD64 and does not depend on the host's glibc version.
 
 ### Manual Linux AMD64 download
 
 Download the archive and checksum from the
 [latest release](https://github.com/CsomePro/jujuleaf/releases/latest), or
-install version 0.1.2 directly:
+install version 0.1.3 directly:
 
 ~~~bash
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.2/jujuleaf-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.2/SHA256SUMS
+curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.3/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf jujuleaf-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
-install -Dm755 jujuleaf-v0.1.2-x86_64-unknown-linux-gnu/jujuleaf ~/.local/bin/jujuleaf
+tar -xzf jujuleaf-v0.1.3-x86_64-unknown-linux-musl.tar.gz
+install -Dm755 jujuleaf-v0.1.3-x86_64-unknown-linux-musl/jujuleaf ~/.local/bin/jujuleaf
 jujuleaf --version
 ~~~
 

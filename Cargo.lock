@@ -2114,7 +2114,7 @@ dependencies = [
 
 [[package]]
 name = "jujuleaf"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anstyle",
  "anyhow",
