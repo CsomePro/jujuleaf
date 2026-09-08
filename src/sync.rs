@@ -2131,7 +2131,10 @@ mod tests {
         .unwrap();
         let nested = temp.path().join("chapters");
         std::fs::create_dir(&nested).unwrap();
-        assert_eq!(discover_root(&nested).unwrap(), temp.path());
+        assert_eq!(
+            discover_root(&nested).unwrap(),
+            temp.path().canonicalize().unwrap()
+        );
         assert_eq!(
             discover_project_context(&nested).unwrap(),
             Some(ProjectContext {
