@@ -57,11 +57,11 @@ jobs:
           - name: Linux AMD64
             os: ubuntu-22.04
             target: x86_64-unknown-linux-musl
-            rustflags: ""
+            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes"
           - name: Linux ARM64
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-musl
-            rustflags: ""
+            rustflags: "-C target-feature=+crt-static -C link-self-contained=yes"
           - name: macOS Apple Silicon
             os: macos-14
             target: aarch64-apple-darwin
@@ -96,10 +96,13 @@ jobs:
           echo "CC_${target_env}=musl-gcc" >> "${GITHUB_ENV}"
           echo "CARGO_TARGET_${target_env^^}_LINKER=musl-gcc" >> "${GITHUB_ENV}"
 
-      - name: Run native tests and target lint
-        run: |
-          cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
-          cargo test --all-targets --locked
+      - name: Run target lint
+        run: cargo clippy --all-targets --all-features --locked --target ${{ matrix.target }} -- -D warnings
+
+      - name: Run native tests
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --all-targets --locked
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
