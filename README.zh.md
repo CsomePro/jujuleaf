@@ -29,7 +29,7 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 > [!IMPORTANT]
 > JujuLeaf 仍处于 1.0 之前的早期阶段，并依赖 Overleaf 私有 API。请先在非关键
-> 项目中试用，或提前保留备份。v0.1.1 暂时只提供 Linux AMD64 预编译版本。
+> 项目中试用，或提前保留备份。v0.1.2 暂时只提供 Linux AMD64 预编译版本。
 
 ## 为什么使用 JujuLeaf？
 
@@ -60,14 +60,14 @@ cargo binstall --strategies crate-meta-data jujuleaf
 ### 手动下载 Linux AMD64 版本
 
 从 [最新 Release](https://github.com/CsomePro/jujuleaf/releases/latest)
-下载压缩包和校验文件，或者直接安装 v0.1.1：
+下载压缩包和校验文件，或者直接安装 v0.1.2：
 
 ~~~bash
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.1/jujuleaf-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.1/SHA256SUMS
+curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.2/jujuleaf-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
+curl -LO https://github.com/CsomePro/jujuleaf/releases/download/v0.1.2/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf jujuleaf-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
-install -Dm755 jujuleaf-v0.1.1-x86_64-unknown-linux-gnu/jujuleaf ~/.local/bin/jujuleaf
+tar -xzf jujuleaf-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
+install -Dm755 jujuleaf-v0.1.2-x86_64-unknown-linux-gnu/jujuleaf ~/.local/bin/jujuleaf
 jujuleaf --version
 ~~~
 

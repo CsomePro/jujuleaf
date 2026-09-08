@@ -2,7 +2,7 @@
   "schema": "jujuleaf.skill",
   "schemaVersion": 1,
   "skillVersion": "0.1.0",
-  "minimumJujuleafVersion": "0.1.1",
+  "minimumJujuleafVersion": "0.1.2",
   "entrypoint": "SKILL.md",
   "invocation": {
     "implicit": true,

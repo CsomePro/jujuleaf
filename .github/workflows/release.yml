@@ -70,11 +70,19 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          asset_name="jujuleaf-${GITHUB_REF_NAME}-${TARGET}"
+          notes_file=".github/release-${GITHUB_REF_NAME}.md"
+          notes_args=(--generate-notes)
+          if [[ -f "${notes_file}" ]]; then
+            notes_args=(--notes-file "${notes_file}")
+          fi
+
           gh release create "${GITHUB_REF_NAME}" \
-            dist/*.tar.gz \
-            dist/SHA256SUMS \
+            "dist/${asset_name}.tar.gz#Linux AMD64 binary" \
+            "dist/SHA256SUMS#SHA-256 checksums" \
             --verify-tag \
-            --generate-notes \
+            --fail-on-no-commits \
+            "${notes_args[@]}" \
             --title "JujuLeaf ${GITHUB_REF_NAME}"
 
       - name: Authenticate with crates.io
