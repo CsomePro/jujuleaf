@@ -1,6 +1,7 @@
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -19,6 +20,10 @@ pub struct CompileReport {
     pub success: bool,
     pub status: String,
     pub diagnostics: Vec<CompileDiagnostic>,
+    pub log_available: bool,
+    pub log_bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_output: Option<PathBuf>,
     pub output_files: Value,
     pub validation_problems: Value,
     pub timings: Value,
@@ -39,9 +44,10 @@ pub fn has_output(result: &Value, path: &str) -> bool {
 
 pub fn parse_compile_log(log: &str) -> Vec<CompileDiagnostic> {
     let file_line = Regex::new(r"^(.+?):(\d+):\s*(.+)$").expect("valid compile-log regex");
-    let latex_warning =
-        Regex::new(r"^(?:LaTeX|Package .+?) Warning:\s*(.+?)(?: on input line (\d+)\.)?$")
-            .expect("valid warning regex");
+    let latex_warning = Regex::new(
+        r"^(?:LaTeX|Package .+?|Class .+?) Warning:\s*(.*?)(?: on input line (\d+)\.)?$",
+    )
+    .expect("valid warning regex");
     let latex_line = Regex::new(r"^l\.(\d+)\s*(.*)$").expect("valid TeX line regex");
     let lines: Vec<_> = log.lines().collect();
     let mut diagnostics = Vec::new();
@@ -80,13 +86,21 @@ pub fn parse_compile_log(log: &str) -> Vec<CompileDiagnostic> {
                 message: detail,
             });
         } else if let Some(captures) = latex_warning.captures(line) {
+            let message = if captures[1].trim().is_empty() {
+                lines
+                    .get(index + 1)
+                    .map(|line| line.trim())
+                    .unwrap_or_default()
+            } else {
+                captures[1].trim()
+            };
             diagnostics.push(CompileDiagnostic {
                 severity: "warning".into(),
                 file: None,
                 line: captures
                     .get(2)
                     .and_then(|value| value.as_str().parse().ok()),
-                message: captures[1].trim().to_owned(),
+                message: message.to_owned(),
             });
         }
         index += 1;
@@ -100,6 +114,7 @@ pub fn build_compile_report(
     result: Value,
     log: Option<String>,
     include_log: bool,
+    log_output: Option<PathBuf>,
 ) -> CompileReport {
     let status = result
         .get("status")
@@ -107,17 +122,22 @@ pub fn build_compile_report(
         .unwrap_or("unknown")
         .to_owned();
     let diagnostics = log.as_deref().map(parse_compile_log).unwrap_or_default();
+    let log_available = log.is_some();
+    let log_bytes = log.as_ref().map_or(0, String::len);
     CompileReport {
         success: status == "success",
         status,
         diagnostics,
+        log_available,
+        log_bytes,
+        log_output,
         output_files: result.get("outputFiles").cloned().unwrap_or(Value::Null),
         validation_problems: result
             .get("validationProblems")
             .cloned()
             .unwrap_or(Value::Null),
         timings: result.get("timings").cloned().unwrap_or(Value::Null),
-        log: include_log.then(|| log.unwrap_or_default()),
+        log: if include_log { log } else { None },
     }
 }
 
@@ -131,14 +151,21 @@ mod tests {
         let log = r#"./chapters/one.tex:12: Undefined control sequence.
 ! Missing $ inserted.
 l.27 bad_math
-LaTeX Warning: Label `x' multiply defined on input line 42."#;
+LaTeX Warning: Label `x' multiply defined on input line 42.
+Class iacrj Warning:
+Your final version will need the textabstract environment.
+."#;
         let diagnostics = parse_compile_log(log);
-        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics.len(), 4);
         assert_eq!(diagnostics[0].file.as_deref(), Some("chapters/one.tex"));
         assert_eq!(diagnostics[0].line, Some(12));
         assert_eq!(diagnostics[1].line, Some(27));
         assert_eq!(diagnostics[2].severity, "warning");
         assert_eq!(diagnostics[2].line, Some(42));
+        assert_eq!(
+            diagnostics[3].message,
+            "Your final version will need the textabstract environment."
+        );
     }
 
     #[test]
@@ -147,9 +174,28 @@ LaTeX Warning: Label `x' multiply defined on input line 42."#;
             json!({"status":"failure","outputFiles":[],"validationProblems":[]}),
             Some("! Broken".into()),
             false,
+            Some(PathBuf::from("build.log")),
         );
         assert!(!report.success);
         assert_eq!(report.diagnostics.len(), 1);
+        assert!(report.log_available);
+        assert_eq!(report.log_bytes, 8);
+        assert_eq!(report.log_output, Some(PathBuf::from("build.log")));
+        assert!(report.log.is_none());
+    }
+
+    #[test]
+    fn report_distinguishes_a_missing_log_from_a_clean_log() {
+        let report = build_compile_report(
+            json!({"status":"success","outputFiles":[]}),
+            None,
+            true,
+            None,
+        );
+        assert!(report.success);
+        assert!(!report.log_available);
+        assert_eq!(report.log_bytes, 0);
+        assert!(report.diagnostics.is_empty());
         assert!(report.log.is_none());
     }
 }

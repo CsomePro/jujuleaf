@@ -586,10 +586,10 @@ enum Command {
         /// Maximum time to wait for Overleaf, in seconds.
         #[arg(long, default_value_t = 720)]
         timeout: u64,
-        /// Include the complete output.log text in command output.
+        /// Include output.log in command output; does not write a local file.
         #[arg(long)]
         show_log: bool,
-        /// Save the complete output.log to this local path.
+        /// Save output.log locally. No log file is written by default.
         #[arg(long)]
         log_output: Option<PathBuf>,
     },
@@ -2117,6 +2117,14 @@ async fn dispatch_authenticated(
             log_output,
         } => {
             ensure!(timeout > 0, "--timeout must be positive");
+            if matches!(pretty, OutputMode::Human { .. }) {
+                notice(
+                    &format!(
+                        "Compiling on Overleaf (timeout: {timeout}s). Diagnostics and output.log become available after the server finishes."
+                    ),
+                    pretty,
+                );
+            }
             let result = match tokio::time::timeout(
                 Duration::from_secs(timeout),
                 api.compile_detailed(&project_id, draft),
@@ -2139,15 +2147,24 @@ async fn dispatch_authenticated(
             } else {
                 None
             };
-            if let Some(path) = log_output {
+            if log.is_none() && matches!(pretty, OutputMode::Human { .. }) {
+                notice(
+                    "Overleaf finished without returning output.log; no diagnostics can be parsed.",
+                    pretty,
+                );
+            }
+            if let Some(path) = log_output.as_ref() {
                 let content = log
                     .as_deref()
                     .ok_or_else(|| anyhow!("compile result did not include output.log"))?;
-                tokio::fs::write(&path, content)
+                tokio::fs::write(path, content)
                     .await
                     .with_context(|| format!("failed to write {}", path.display()))?;
             }
-            output(build_compile_report(result, log, show_log), pretty)
+            output(
+                build_compile_report(result, log, show_log, log_output),
+                pretty,
+            )
         }
         Command::Pdf {
             project_id,

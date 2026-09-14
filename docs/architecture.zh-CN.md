@@ -363,9 +363,11 @@ clone 根目录的 `.jujuleafignore` 使用 gitignore 语法。规则同时作�
 ## 12. 编译与前台监控
 
 `compile` 调用 Overleaf 的同步编译 HTTP 接口；这个请求在服务端等待 CLSI 返回，
-JujuLeaf 额外设置客户端超时，超时后调用 `/compile/stop`。完成后下载
-`output.log`，识别 `file:line:`、TeX `!` 错误和常见 warning，输出结构化
-diagnostics；完整日志可显示或保存到文件。
+因此服务端完成前没有可供 JujuLeaf 下载和解析的 `output.log`。JujuLeaf 额外
+设置客户端超时，超时后调用 `/compile/stop`。完成后下载 `output.log`，识别
+`file:line:`、TeX `!` 错误，以及 LaTeX、Package、Class warning，输出结构化
+diagnostics。默认不写本地日志；`--show-log` 只将日志放入命令输出，
+`--log-output PATH` 才保存文件。
 
 `sync --watch` 是前台轮询器：每个周期严格串行执行 pull→push，周期之间等待，
 Ctrl+C 正常退出，遇到任何正文、元数据或二进制冲突立即停止。当前不派生后台

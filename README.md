@@ -29,7 +29,7 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 > [!IMPORTANT]
 > JujuLeaf is pre-1.0 software built on private Overleaf APIs. Start with a
-> non-critical project or keep a backup. v0.1.4-rc.1 is a cross-platform preview;
+> non-critical project or keep a backup. v0.4.1-rc.2 is a cross-platform preview;
 > the current stable v0.1.3 release provides a Linux AMD64 binary only.
 
 ## Why JujuLeaf?
@@ -62,12 +62,12 @@ The stable v0.1.3 binary targets Linux AMD64 and is fully static, so it does not
 depend on the host's glibc version. For unattended environments, add
 `--no-confirm`.
 
-### Try the v0.1.4 cross-platform preview
+### Try the v0.4.1 cross-platform preview
 
 Install or upgrade specifically to the release candidate:
 
 ~~~bash
-cargo binstall --strategies crate-meta-data --force jujuleaf@0.1.4-rc.1
+cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.2
 jujuleaf --version
 ~~~
 
@@ -88,7 +88,7 @@ is required.
 ### Manual download
 
 Download the archive for your target and `SHA256SUMS` from the
-[v0.1.4-rc.1 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.1.4-rc.1).
+[v0.4.1-rc.2 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.2).
 Linux and macOS archives contain `jujuleaf`; the Windows ZIP contains
 `jujuleaf.exe`. Put that executable in a directory on your `PATH`.
 
@@ -169,7 +169,13 @@ use the current project:
 jujuleaf files
 jujuleaf read main.tex --content-only
 jujuleaf compile
+jujuleaf compile --log-output output.log
 ~~~
+
+Overleaf's compile endpoint returns only after the server-side build finishes.
+JujuLeaf then downloads `output.log` and parses its diagnostics. The default
+command does not create a local log file; use `--log-output PATH` to save one
+or `--show-log` to include it in the command output.
 
 Edit files with your usual tools, record a local checkpoint, then synchronize:
 
@@ -446,7 +452,7 @@ offline form skips the network check. `auth status` never prints the cookie;
 
 ## Current limitations
 
-- v0.1.4-rc.1 is the first macOS, Windows, and Linux ARM64 preview; use it first
+- v0.4.1-rc.2 is a macOS, Windows, and Linux ARM64 preview; use it first
   on a non-critical project and report platform-specific issues.
 - Browser login requires Chrome, Chromium, or Edge, unless an existing session
   cookie is supplied.
