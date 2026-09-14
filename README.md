@@ -29,7 +29,7 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 > [!IMPORTANT]
 > JujuLeaf is pre-1.0 software built on private Overleaf APIs. Start with a
-> non-critical project or keep a backup. v0.4.1-rc.2 is a cross-platform preview;
+> non-critical project or keep a backup. v0.4.1-rc.3 is a cross-platform preview;
 > the current stable v0.1.3 release provides a Linux AMD64 binary only.
 
 ## Why JujuLeaf?
@@ -67,7 +67,7 @@ depend on the host's glibc version. For unattended environments, add
 Install or upgrade specifically to the release candidate:
 
 ~~~bash
-cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.2
+cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.3
 jujuleaf --version
 ~~~
 
@@ -88,7 +88,7 @@ is required.
 ### Manual download
 
 Download the archive for your target and `SHA256SUMS` from the
-[v0.4.1-rc.2 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.2).
+[v0.4.1-rc.3 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.3).
 Linux and macOS archives contain `jujuleaf`; the Windows ZIP contains
 `jujuleaf.exe`. Put that executable in a directory on your `PATH`.
 
@@ -452,7 +452,7 @@ offline form skips the network check. `auth status` never prints the cookie;
 
 ## Current limitations
 
-- v0.4.1-rc.2 is a macOS, Windows, and Linux ARM64 preview; use it first
+- v0.4.1-rc.3 is a macOS, Windows, and Linux ARM64 preview; use it first
   on a non-critical project and report platform-specific issues.
 - Browser login requires Chrome, Chromium, or Edge, unless an existing session
   cookie is supplied.

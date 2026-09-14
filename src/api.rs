@@ -3,13 +3,14 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, HeaderMap, HeaderValue, LOCATION, SET_COOKIE};
-use reqwest::{Method, Response, StatusCode};
+use reqwest::{Method, Response, StatusCode, Version};
 use serde_json::{Value, json};
 
 use crate::auth::{Session, SessionStore, merge_supported_cookie};
 
 pub struct OverleafApi {
     client: reqwest::Client,
+    compile_client: reqwest::Client,
     base_url: String,
     cookie: String,
     csrf: Option<String>,
@@ -21,8 +22,13 @@ impl OverleafApi {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
+        let compile_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .http1_only()
+            .build()?;
         Ok(Self {
             client,
+            compile_client,
             base_url: session.base_url.trim_end_matches('/').to_owned(),
             cookie: session.cookie.clone(),
             csrf: None,
@@ -40,6 +46,13 @@ impl OverleafApi {
 
     pub fn csrf(&self) -> Option<&str> {
         self.csrf.as_deref()
+    }
+
+    fn uses_cstcloud_compile_compatibility(&self) -> bool {
+        reqwest::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .is_some_and(|host| host.eq_ignore_ascii_case("latex.cstcloud.cn"))
     }
 
     pub(crate) fn adopt_cookie(&mut self, cookie: &str) -> Result<()> {
@@ -212,12 +225,29 @@ impl OverleafApi {
     }
 
     pub async fn compile_detailed(&mut self, project_id: &str, draft: bool) -> Result<Value> {
-        self.post_json(
-            &format!("/project/{project_id}/compile?file_line_errors=true"),
-            json!({"check": "silent", "draft": draft}),
-            "compile project",
-        )
-        .await
+        let path = format!("/project/{project_id}/compile?file_line_errors=true");
+        let body = json!({"check": "silent", "draft": draft});
+        if !self.uses_cstcloud_compile_compatibility() {
+            return self.post_json(&path, body, "compile project").await;
+        }
+
+        // CSTCloud sends HTTP 102 Processing while CLSI compiles. Reqwest/Hyper
+        // can wait indefinitely on that response chain. HTTP/1.0 forbids
+        // informational responses, so the proxy sends only the final result.
+        if self.csrf.is_none() {
+            self.fetch_csrf().await?;
+        }
+        let response = self
+            .compile_client
+            .post(self.url(&path))
+            .version(Version::HTTP_10)
+            .headers(self.headers(true)?)
+            .header(CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let response = self.finish_response(response).await?;
+        Self::json_response(response, "compile project").await
     }
 
     pub async fn stop_compile(&mut self, project_id: &str) -> Result<Value> {
@@ -607,6 +637,35 @@ mod tests {
         assert_eq!(
             api.url("https://cdn.example.test/output.pdf"),
             "https://cdn.example.test/output.pdf"
+        );
+    }
+
+    #[test]
+    fn compile_compatibility_is_scoped_to_the_cstcloud_host() {
+        let cstcloud = Session::new("token", "https://latex.cstcloud.cn/");
+        let cstcloud_with_port = Session::new("token", "https://latex.cstcloud.cn:443");
+        let official = Session::new("token", "https://www.overleaf.com");
+        let self_hosted = Session::new("token", "https://latex.example.edu");
+
+        assert!(
+            OverleafApi::new(&cstcloud, None)
+                .unwrap()
+                .uses_cstcloud_compile_compatibility()
+        );
+        assert!(
+            OverleafApi::new(&cstcloud_with_port, None)
+                .unwrap()
+                .uses_cstcloud_compile_compatibility()
+        );
+        assert!(
+            !OverleafApi::new(&official, None)
+                .unwrap()
+                .uses_cstcloud_compile_compatibility()
+        );
+        assert!(
+            !OverleafApi::new(&self_hosted, None)
+                .unwrap()
+                .uses_cstcloud_compile_compatibility()
         );
     }
 

@@ -29,7 +29,7 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 > [!IMPORTANT]
 > JujuLeaf 仍处于 1.0 之前的早期阶段，并依赖 Overleaf 私有 API。请先在非关键
-> 项目中试用，或提前保留备份。v0.4.1-rc.2 是跨平台预览版；当前稳定版
+> 项目中试用，或提前保留备份。v0.4.1-rc.3 是跨平台预览版；当前稳定版
 > v0.1.3 仍只提供 Linux AMD64 预编译文件。
 
 ## 为什么使用 JujuLeaf？
@@ -64,7 +64,7 @@ cargo binstall --strategies crate-meta-data jujuleaf
 指定版本即可安装或升级到本次候选版本：
 
 ~~~bash
-cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.2
+cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.3
 jujuleaf --version
 ~~~
 
@@ -83,7 +83,7 @@ macOS 版本只依赖 Apple 系统库，Windows 版本只依赖 Windows 系统�
 
 ### 手动下载
 
-从 [v0.4.1-rc.2 预发布页面](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.2)
+从 [v0.4.1-rc.3 预发布页面](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.3)
 下载对应 target 的压缩包和 `SHA256SUMS`。Linux 与 macOS 压缩包内是
 `jujuleaf`，Windows ZIP 内是 `jujuleaf.exe`；将它放入 `PATH` 中的目录即可。
 
@@ -422,7 +422,7 @@ Cookie；`auth logout` 会删除所选本地 profile 及其凭据。
 
 ## 当前限制
 
-- v0.4.1-rc.2 是 macOS、Windows 和 Linux ARM64 预览版；建议先在非关键
+- v0.4.1-rc.3 是 macOS、Windows 和 Linux ARM64 预览版；建议先在非关键
   项目中使用，并反馈平台相关问题。
 - 浏览器登录需要 Chrome、Chromium 或 Edge；也可以直接提供已有的会话 Cookie。
 - 同步只在前台运行，目前没有后台服务。

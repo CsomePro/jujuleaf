@@ -49,6 +49,9 @@ pub fn parse_compile_log(log: &str) -> Vec<CompileDiagnostic> {
     )
     .expect("valid warning regex");
     let latex_line = Regex::new(r"^l\.(\d+)\s*(.*)$").expect("valid TeX line regex");
+    let box_warning =
+        Regex::new(r"^(?:Underfull|Overfull) \\[hv]box\b").expect("valid box warning regex");
+    let box_warning_line = Regex::new(r"\bat lines? (\d+)").expect("valid box warning line regex");
     let lines: Vec<_> = log.lines().collect();
     let mut diagnostics = Vec::new();
     let mut index = 0;
@@ -102,11 +105,19 @@ pub fn parse_compile_log(log: &str) -> Vec<CompileDiagnostic> {
                     .and_then(|value| value.as_str().parse().ok()),
                 message: message.to_owned(),
             });
+        } else if box_warning.is_match(line) {
+            diagnostics.push(CompileDiagnostic {
+                severity: "warning".into(),
+                file: None,
+                line: box_warning_line
+                    .captures(line)
+                    .and_then(|captures| captures[1].parse().ok()),
+                message: line.to_owned(),
+            });
         }
         index += 1;
     }
 
-    diagnostics.dedup();
     diagnostics
 }
 
@@ -154,9 +165,13 @@ l.27 bad_math
 LaTeX Warning: Label `x' multiply defined on input line 42.
 Class iacrj Warning:
 Your final version will need the textabstract environment.
+Underfull \hbox (badness 4765) in paragraph at lines 175--176
+Underfull \hbox (badness 4765) in paragraph at lines 175--176
+Underfull \vbox (badness 10000) has occurred while \output is active []
+Overfull \hbox (1.0pt too wide) in paragraph at line 51
 ."#;
         let diagnostics = parse_compile_log(log);
-        assert_eq!(diagnostics.len(), 4);
+        assert_eq!(diagnostics.len(), 8);
         assert_eq!(diagnostics[0].file.as_deref(), Some("chapters/one.tex"));
         assert_eq!(diagnostics[0].line, Some(12));
         assert_eq!(diagnostics[1].line, Some(27));
@@ -166,6 +181,10 @@ Your final version will need the textabstract environment.
             diagnostics[3].message,
             "Your final version will need the textabstract environment."
         );
+        assert_eq!(diagnostics[4].line, Some(175));
+        assert_eq!(diagnostics[5].line, Some(175));
+        assert_eq!(diagnostics[6].line, None);
+        assert_eq!(diagnostics[7].line, Some(51));
     }
 
     #[test]
