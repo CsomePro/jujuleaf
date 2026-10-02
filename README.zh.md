@@ -29,8 +29,8 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 
 > [!IMPORTANT]
 > JujuLeaf 仍处于 1.0 之前的早期阶段，并依赖 Overleaf 私有 API。请先在非关键
-> 项目中试用，或提前保留备份。v0.4.1-rc.3 是跨平台预览版；当前稳定版
-> v0.1.3 仍只提供 Linux AMD64 预编译文件。
+> 项目中试用，或提前保留备份。v0.4.1 是第一个跨平台稳定版，但不同实例的
+> 私有 API 行为仍可能存在差异。
 
 ## 为什么使用 JujuLeaf？
 
@@ -56,15 +56,11 @@ Coding Agent，通过内嵌的 Jujutsu 引擎保留可恢复的本地历史，�
 cargo binstall --strategies crate-meta-data jujuleaf
 ~~~
 
-稳定版 v0.1.3 的预编译文件面向 Linux AMD64，并采用完全静态链接，不依赖宿主机
-的 glibc 版本。无人值守环境可增加 `--no-confirm`。
-
-### 试用 v0.4.1 跨平台预览版
-
-指定版本即可安装或升级到本次候选版本：
+已有安装可增加 `--force` 重新安装或升级；无人值守环境可再增加
+`--no-confirm`：
 
 ~~~bash
-cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.3
+cargo binstall --strategies crate-meta-data --force jujuleaf
 jujuleaf --version
 ~~~
 
@@ -83,7 +79,7 @@ macOS 版本只依赖 Apple 系统库，Windows 版本只依赖 Windows 系统�
 
 ### 手动下载
 
-从 [v0.4.1-rc.3 预发布页面](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.3)
+从 [v0.4.1 正式发布页面](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1)
 下载对应 target 的压缩包和 `SHA256SUMS`。Linux 与 macOS 压缩包内是
 `jujuleaf`，Windows ZIP 内是 `jujuleaf.exe`；将它放入 `PATH` 中的目录即可。
 
@@ -213,6 +209,22 @@ jujuleaf review finish
 
 JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告外来改动或只处理了
 一部分的修订。
+
+新建 review 默认使用 `adaptive` 粒度：像 `model` → `models` 这样只增加一个
+`s` 的修改仍然只产生一个字符的修订；同一个单词或短语内密集、碎片化的修改会
+合并成一个便于阅读的 review hunk。普通 `sync` 和 `push` 始终保留精确的字符级
+传输 diff，不会为了显示效果扩大修改范围，从而尽量保护评论锚点和并发编辑。
+
+也可以在开始工作时显式选择策略：
+
+~~~bash
+jujuleaf begin -m "逐字校正" --granularity exact
+jujuleaf begin -m "术语清理" --granularity word
+jujuleaf begin -m "重写段落" --granularity sentence
+~~~
+
+选定的策略与 diff 算法版本会写入 review 状态。`review diff` 会同时报告面向
+审阅的 hunk 数量与底层原子修改数量；提交中断后，重试会校验持久化的计划。
 
 ## 常用命令
 
@@ -422,8 +434,8 @@ Cookie；`auth logout` 会删除所选本地 profile 及其凭据。
 
 ## 当前限制
 
-- v0.4.1-rc.3 是 macOS、Windows 和 Linux ARM64 预览版；建议先在非关键
-  项目中使用，并反馈平台相关问题。
+- 预编译文件当前覆盖 Linux AMD64/ARM64、macOS Apple Silicon/Intel 和
+  Windows AMD64。
 - 浏览器登录需要 Chrome、Chromium 或 Edge；也可以直接提供已有的会话 Cookie。
 - 同步只在前台运行，目前没有后台服务。
 - Overleaf 私有 API 可能随时变化，自托管实例尤其如此。

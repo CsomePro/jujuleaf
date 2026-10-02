@@ -29,8 +29,8 @@ edits back into Overleaf collaboration events instead of replacing whole files.
 
 > [!IMPORTANT]
 > JujuLeaf is pre-1.0 software built on private Overleaf APIs. Start with a
-> non-critical project or keep a backup. v0.4.1-rc.3 is a cross-platform preview;
-> the current stable v0.1.3 release provides a Linux AMD64 binary only.
+> non-critical project or keep a backup. v0.4.1 is the first stable
+> cross-platform release, but private API behavior can still vary by instance.
 
 ## Why JujuLeaf?
 
@@ -58,16 +58,11 @@ install the current stable release:
 cargo binstall --strategies crate-meta-data jujuleaf
 ~~~
 
-The stable v0.1.3 binary targets Linux AMD64 and is fully static, so it does not
-depend on the host's glibc version. For unattended environments, add
-`--no-confirm`.
-
-### Try the v0.4.1 cross-platform preview
-
-Install or upgrade specifically to the release candidate:
+Use `--force` to reinstall or upgrade an existing JujuLeaf installation. For
+unattended environments, add `--no-confirm`:
 
 ~~~bash
-cargo binstall --strategies crate-meta-data --force jujuleaf@0.4.1-rc.3
+cargo binstall --strategies crate-meta-data --force jujuleaf
 jujuleaf --version
 ~~~
 
@@ -88,7 +83,7 @@ is required.
 ### Manual download
 
 Download the archive for your target and `SHA256SUMS` from the
-[v0.4.1-rc.3 prerelease](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1-rc.3).
+[v0.4.1 release](https://github.com/CsomePro/jujuleaf/releases/tag/v0.4.1).
 Linux and macOS archives contain `jujuleaf`; the Windows ZIP contains
 `jujuleaf.exe`. Put that executable in a directory on your `PATH`.
 
@@ -222,6 +217,24 @@ jujuleaf review finish
 
 JujuLeaf keeps the review anchored to its synchronized baseline and reports
 foreign or partially resolved changes before closing it.
+
+New reviews use `adaptive` granularity: an isolated edit such as adding the
+`s` in `model` → `models` remains a one-character tracked change, while a
+dense rewrite inside one word or phrase is presented as one review hunk.
+Ordinary `sync` and `push` always keep their exact character-level transport
+diff so comment anchors and concurrent edits are not widened.
+
+Choose a different review policy when starting the work:
+
+~~~bash
+jujuleaf begin -m "literal corrections" --granularity exact
+jujuleaf begin -m "terminology cleanup" --granularity word
+jujuleaf begin -m "rewrite prose" --granularity sentence
+~~~
+
+The selected policy and diff algorithm are stored with the review. `review diff`
+reports both review hunks and underlying atomic edits, and interrupted
+submissions verify the persisted plan before retrying.
 
 ## Everyday commands
 
@@ -452,8 +465,8 @@ offline form skips the network check. `auth status` never prints the cookie;
 
 ## Current limitations
 
-- v0.4.1-rc.3 is a macOS, Windows, and Linux ARM64 preview; use it first
-  on a non-critical project and report platform-specific issues.
+- Release binaries currently cover Linux AMD64/ARM64, macOS Apple
+  Silicon/Intel, and Windows AMD64.
 - Browser login requires Chrome, Chromium, or Edge, unless an existing session
   cookie is supplied.
 - Synchronization is foreground-only; there is no background service.

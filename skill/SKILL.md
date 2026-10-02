@@ -204,14 +204,24 @@ Interpret the boundary as `synchronized parent -> described child work`.
 `begin` requires a clean synchronized baseline with no pending tracked
 changes, then creates a new described Jujutsu child. It is the work boundary;
 `checkpoint` only snapshots the current child and does not start another one.
+New review work defaults to `--granularity adaptive`: keep an isolated edit
+exact, but combine multiple fragmented edits inside one word or a dense phrase
+into a readable tracked-change hunk. Use `--granularity exact` for strictly
+literal review atoms, `word` for word-local grouping, or `sentence` only when
+the user explicitly wants broader prose review. Ordinary `sync` and `push`
+always retain exact character-level transport changes.
 
 Apply these review rules:
 
 - Use `review diff` before submission. It verifies that every remote document
   still has the version, visible content, comments, and tracked-change metadata
-  captured at `begin`.
+  captured at `begin`. Read `totalChanges` as the semantic review-hunk count
+  and `totalAtomicChanges` as the underlying minimal edit count; inspect the
+  top-level `hunks` array for line, column, and compact before/after previews.
 - Use `review submit` to publish the local diff as Overleaf tracked changes.
-  Do not use direct `push`, `sync`, or per-file `suggest` for that batch.
+  The granularity, algorithm version, and per-document plan hash are frozen for
+  deterministic retries. Do not use direct `push`, `sync`, or per-file
+  `suggest` for that batch.
 - Treat submitted local files as frozen. `review status` reports owned pending
   changes, foreign pending changes, unsubmitted files, unresolved receipts,
   post-submit local edits, and `readyToFinish`.

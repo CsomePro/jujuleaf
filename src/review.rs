@@ -11,8 +11,8 @@ use crate::auth::Session;
 use crate::file_util::atomic_write;
 use crate::jj::JjWorkspace;
 use crate::operations::{
-    BuildOptions, DocumentState, HISTORY_OT, build_document_operations, minimal_text_changes,
-    parse_document_snapshot, utf16_len,
+    BuildOptions, DocumentState, HISTORY_OT, REVIEW_DIFF_ALGORITHM, ReviewGranularity,
+    build_document_operations, parse_document_snapshot, review_text_changes, slice_utf16,
 };
 use crate::platform::workspace_path;
 use crate::project::{DocumentRef, collect_entities, connect_project_with_api};
@@ -51,6 +51,16 @@ struct ReviewDocument {
     receipt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planned_change_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    planned_atomic_change_count: Option<usize>,
+}
+
+fn default_review_diff_algorithm() -> String {
+    REVIEW_DIFF_ALGORITHM.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +69,10 @@ pub struct ReviewState {
     schema_version: u32,
     project_id: String,
     description: String,
+    #[serde(default)]
+    granularity: ReviewGranularity,
+    #[serde(default = "default_review_diff_algorithm")]
+    diff_algorithm: String,
     phase: ReviewPhase,
     started_at: String,
     base_operation_id: String,
@@ -77,6 +91,8 @@ pub struct BeginSummary {
     success: bool,
     project_id: String,
     description: String,
+    granularity: ReviewGranularity,
+    diff_algorithm: String,
     phase: ReviewPhase,
     operation_id: String,
     commit_id: String,
@@ -99,8 +115,22 @@ pub struct ReviewAbortSummary {
 pub struct ReviewFileDiff {
     path: String,
     change_count: usize,
+    atomic_change_count: usize,
     removed: usize,
     inserted: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewHunkDiff {
+    path: String,
+    hunk: usize,
+    line: usize,
+    column: usize,
+    atomic_change_count: usize,
+    removed: usize,
+    inserted: usize,
+    change: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,9 +139,13 @@ pub struct ReviewDiffSummary {
     success: bool,
     project_id: String,
     description: String,
+    granularity: ReviewGranularity,
+    diff_algorithm: String,
     phase: ReviewPhase,
     files: Vec<ReviewFileDiff>,
+    hunks: Vec<ReviewHunkDiff>,
     total_changes: usize,
+    total_atomic_changes: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +154,8 @@ pub struct ReviewSubmitSummary {
     success: bool,
     project_id: String,
     description: String,
+    granularity: ReviewGranularity,
+    diff_algorithm: String,
     phase: ReviewPhase,
     submitted: Vec<ReviewSubmittedFile>,
     unchanged: Vec<String>,
@@ -132,6 +168,7 @@ pub struct ReviewSubmitSummary {
 pub struct ReviewSubmittedFile {
     path: String,
     change_count: usize,
+    atomic_change_count: usize,
     change_ids: Vec<String>,
     acknowledged_version: i64,
 }
@@ -398,6 +435,65 @@ fn validate_binding(
     Ok(binding)
 }
 
+fn require_supported_diff_algorithm(state: &ReviewState) -> Result<()> {
+    ensure!(
+        state.diff_algorithm == REVIEW_DIFF_ALGORITHM,
+        "review work uses unsupported diff algorithm '{}'; update JujuLeaf or abort this unsubmitted review",
+        state.diff_algorithm
+    );
+    Ok(())
+}
+
+fn compact_change_text(text: &str) -> String {
+    if text.is_empty() {
+        return "∅".to_owned();
+    }
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.is_empty() {
+        return text
+            .chars()
+            .map(|character| match character {
+                ' ' => '␠',
+                '\t' => '⇥',
+                '\n' | '\r' => '↵',
+                _ => character,
+            })
+            .take(56)
+            .collect();
+    }
+    const LIMIT: usize = 56;
+    let mut characters = compact.chars();
+    let prefix: String = characters.by_ref().take(LIMIT).collect();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
+fn review_change_location(content: &str, position: usize) -> Result<(usize, usize)> {
+    let prefix = slice_utf16(content, 0, position)?;
+    let line = prefix
+        .chars()
+        .filter(|character| *character == '\n')
+        .count()
+        + 1;
+    let current_line = prefix.rsplit_once('\n').map_or(prefix, |(_, tail)| tail);
+    let column = current_line.encode_utf16().count() + 1;
+    Ok((line, column))
+}
+
+fn review_plan_hash(
+    granularity: ReviewGranularity,
+    changes: &[crate::operations::InputChange],
+) -> Result<String> {
+    Ok(bytes_hash(&serde_json::to_vec(&json!({
+        "algorithm": REVIEW_DIFF_ALGORITHM,
+        "granularity": granularity,
+        "changes": changes,
+    }))?))
+}
+
 fn document_map(documents: Vec<DocumentRef>) -> BTreeMap<String, DocumentRef> {
     documents
         .into_iter()
@@ -486,7 +582,11 @@ fn require_known_workspace_files(root: &Path, project_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn begin_review(root: &Path, description: &str) -> Result<BeginSummary> {
+pub async fn begin_review(
+    root: &Path,
+    description: &str,
+    granularity: ReviewGranularity,
+) -> Result<BeginSummary> {
     ensure!(load_state(root)?.is_none(), "review work is already active");
     let description = description.trim();
     ensure!(!description.is_empty(), "work description cannot be empty");
@@ -529,6 +629,9 @@ pub async fn begin_review(root: &Path, description: &str) -> Result<BeginSummary
                 submitted_version: None,
                 receipt_id: None,
                 final_hash: None,
+                plan_hash: None,
+                planned_change_count: None,
+                planned_atomic_change_count: None,
             },
         );
     }
@@ -544,6 +647,8 @@ pub async fn begin_review(root: &Path, description: &str) -> Result<BeginSummary
         schema_version: 1,
         project_id: binding.project_id.clone(),
         description: description.to_owned(),
+        granularity,
+        diff_algorithm: REVIEW_DIFF_ALGORITHM.to_owned(),
         phase: ReviewPhase::Draft,
         started_at: Utc::now().to_rfc3339(),
         base_operation_id,
@@ -559,6 +664,8 @@ pub async fn begin_review(root: &Path, description: &str) -> Result<BeginSummary
         success: true,
         project_id: binding.project_id,
         description: description.to_owned(),
+        granularity,
+        diff_algorithm: REVIEW_DIFF_ALGORITHM.to_owned(),
         phase: ReviewPhase::Draft,
         operation_id: work.operation_id,
         commit_id: work.commit_id,
@@ -593,6 +700,7 @@ pub async fn review_diff_with_api(
     api: &mut OverleafApi,
 ) -> Result<ReviewDiffSummary> {
     let state = require_state(root)?;
+    require_supported_diff_algorithm(&state)?;
     ensure!(
         state.phase == ReviewPhase::Draft,
         "review diff is available before submit; use review status after submit"
@@ -611,6 +719,7 @@ pub async fn review_diff_with_api(
         "remote document set changed since begin; abort, synchronize, and begin review work again"
     );
     let mut files = Vec::new();
+    let mut hunks = Vec::new();
     for (doc_id, baseline) in &state.documents {
         let document = documents
             .get(doc_id)
@@ -638,34 +747,52 @@ pub async fn review_diff_with_api(
             baseline.path
         );
         let local = read_document(root, &baseline.path)?;
-        let changes = minimal_text_changes(&remote.content, &local);
-        if changes.is_empty() {
+        let planned = review_text_changes(&remote.content, &local, state.granularity)?;
+        if planned.is_empty() {
             continue;
         }
-        let removed = changes
-            .iter()
-            .map(|change| utf16_len(change.expect.as_deref().unwrap_or_default()))
-            .sum();
-        let inserted = changes
-            .iter()
-            .map(|change| utf16_len(change.insert.as_deref().unwrap_or_default()))
-            .sum();
+        let removed = planned.iter().map(|item| item.removed).sum();
+        let inserted = planned.iter().map(|item| item.inserted).sum();
+        let atomic_change_count = planned.iter().map(|item| item.atomic_change_count).sum();
+        for (index, item) in planned.iter().enumerate() {
+            let (line, column) = review_change_location(&remote.content, item.change.from)?;
+            hunks.push(ReviewHunkDiff {
+                path: baseline.path.clone(),
+                hunk: index + 1,
+                line,
+                column,
+                atomic_change_count: item.atomic_change_count,
+                removed: item.removed,
+                inserted: item.inserted,
+                change: format!(
+                    "{} → {}",
+                    compact_change_text(item.change.expect.as_deref().unwrap_or_default()),
+                    compact_change_text(item.change.insert.as_deref().unwrap_or_default())
+                ),
+            });
+        }
         files.push(ReviewFileDiff {
             path: baseline.path.clone(),
-            change_count: changes.len(),
+            change_count: planned.len(),
+            atomic_change_count,
             removed,
             inserted,
         });
     }
     socket.close().await.ok();
     let total_changes = files.iter().map(|file| file.change_count).sum();
+    let total_atomic_changes = files.iter().map(|file| file.atomic_change_count).sum();
     Ok(ReviewDiffSummary {
         success: true,
         project_id: binding.project_id,
         description: state.description,
+        granularity: state.granularity,
+        diff_algorithm: state.diff_algorithm,
         phase: state.phase,
         files,
+        hunks,
         total_changes,
+        total_atomic_changes,
     })
 }
 
@@ -677,6 +804,7 @@ pub async fn submit_review_with_api(
     options: &UpdateOptions,
 ) -> Result<ReviewSubmitSummary> {
     let mut state = require_state(root)?;
+    require_supported_diff_algorithm(&state)?;
     ensure!(
         matches!(state.phase, ReviewPhase::Draft | ReviewPhase::Submitting),
         "review work has already been submitted"
@@ -750,7 +878,12 @@ pub async fn submit_review_with_api(
                 );
                 submitted.push(ReviewSubmittedFile {
                     path: baseline.path,
-                    change_count: baseline.change_ids.len(),
+                    change_count: baseline
+                        .planned_change_count
+                        .unwrap_or(baseline.change_ids.len()),
+                    atomic_change_count: baseline
+                        .planned_atomic_change_count
+                        .unwrap_or(baseline.change_ids.len()),
                     change_ids: baseline.change_ids,
                     acknowledged_version: baseline.submitted_version.unwrap_or(remote.version),
                 });
@@ -806,7 +939,10 @@ pub async fn submit_review_with_api(
                 save_state(root, &state)?;
                 submitted.push(ReviewSubmittedFile {
                     path: baseline.path,
-                    change_count: change_ids.len(),
+                    change_count: baseline.planned_change_count.unwrap_or(change_ids.len()),
+                    atomic_change_count: baseline
+                        .planned_atomic_change_count
+                        .unwrap_or(change_ids.len()),
                     change_ids,
                     acknowledged_version: remote.version,
                 });
@@ -883,12 +1019,32 @@ pub async fn submit_review_with_api(
             "local file changed after review submission started: {}",
             baseline.path
         );
-        let changes = minimal_text_changes(&document_state.content, &local);
-        if changes.is_empty() {
+        let planned = review_text_changes(&document_state.content, &local, state.granularity)?;
+        if planned.is_empty() {
             unchanged.push(baseline.path);
             socket.leave_doc(&document.id).await.ok();
             continue;
         }
+        let changes: Vec<_> = planned.iter().map(|item| item.change.clone()).collect();
+        let atomic_change_count = planned.iter().map(|item| item.atomic_change_count).sum();
+        let plan_hash = review_plan_hash(state.granularity, &changes)?;
+        if let Some(expected) = &baseline.plan_hash {
+            ensure!(
+                expected == &plan_hash,
+                "review plan changed while submission was interrupted: {}",
+                baseline.path
+            );
+        }
+        {
+            let entry = state
+                .documents
+                .get_mut(&doc_id)
+                .expect("document key exists");
+            entry.plan_hash = Some(plan_hash);
+            entry.planned_change_count = Some(planned.len());
+            entry.planned_atomic_change_count = Some(atomic_change_count);
+        }
+        save_state(root, &state)?;
 
         let user_id = if document_state.ot_type == HISTORY_OT {
             if history_user_id.is_none() {
@@ -998,7 +1154,8 @@ pub async fn submit_review_with_api(
         save_state(root, &state)?;
         submitted.push(ReviewSubmittedFile {
             path: baseline.path,
-            change_count: built.changes.len(),
+            change_count: planned.len(),
+            atomic_change_count,
             change_ids,
             acknowledged_version: refreshed.version,
         });
@@ -1013,6 +1170,8 @@ pub async fn submit_review_with_api(
         success: true,
         project_id: binding.project_id,
         description: state.description,
+        granularity: state.granularity,
+        diff_algorithm: state.diff_algorithm,
         phase: state.phase,
         submitted,
         unchanged,
@@ -1321,6 +1480,9 @@ mod tests {
             submitted_version: None,
             receipt_id: None,
             final_hash: None,
+            plan_hash: None,
+            planned_change_count: None,
+            planned_atomic_change_count: None,
         }
     }
 
@@ -1329,6 +1491,8 @@ mod tests {
             schema_version: 1,
             project_id: "p1".into(),
             description: "test review".into(),
+            granularity: ReviewGranularity::Adaptive,
+            diff_algorithm: REVIEW_DIFF_ALGORITHM.into(),
             phase,
             started_at: "2026-01-01T00:00:00Z".into(),
             base_operation_id: "op-base".into(),
@@ -1338,6 +1502,24 @@ mod tests {
             submitted_commit_id: None,
             documents: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn legacy_review_state_defaults_to_exact_granularity() {
+        let mut value = serde_json::to_value(test_state(ReviewPhase::Draft)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("granularity");
+        object.remove("diffAlgorithm");
+
+        let decoded: ReviewState = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.granularity, ReviewGranularity::Exact);
+        assert_eq!(decoded.diff_algorithm, REVIEW_DIFF_ALGORITHM);
+    }
+
+    #[test]
+    fn review_preview_distinguishes_empty_and_whitespace() {
+        assert_eq!(compact_change_text(""), "∅");
+        assert_eq!(compact_change_text(" \t\n"), "␠⇥↵");
     }
 
     #[test]
@@ -1424,10 +1606,17 @@ mod tests {
             .upsert_document_metadata("p1", "d1", 3, &bytes_hash(b"meta"), "{}", "{}")
             .unwrap();
 
-        let begun = begin_review(root, "rewrite introduction").await.unwrap();
+        let begun = begin_review(root, "rewrite introduction", ReviewGranularity::Adaptive)
+            .await
+            .unwrap();
         assert_eq!(begun.phase, ReviewPhase::Draft);
+        assert_eq!(begun.granularity, ReviewGranularity::Adaptive);
         assert!(ensure_sync_allowed(root, "sync").is_err());
-        assert!(begin_review(root, "second work").await.is_err());
+        assert!(
+            begin_review(root, "second work", ReviewGranularity::Exact)
+                .await
+                .is_err()
+        );
 
         std::fs::write(root.join("main.tex"), "local draft").unwrap();
         let state = require_state(root).unwrap();

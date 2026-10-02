@@ -315,10 +315,17 @@ sync → begin → draft → review submit → submitting → submitted → fini
 
 `review diff` 和首次 `review submit` 都重新读取实时文档，并严格核对 version、
 正文 hash 和 comments/tracked-change metadata hash。任何并发变化都会在发送
-OT 前停止。提交时，本地各文件的提案 hash 被冻结，文本差异使用 tracked OT
-发送；显式 change ID 不存在时，以完整 tracked-change JSON 的稳定 hash 作为
-本地身份。操作仍经过 SQLite receipt 的 prepared/inflight/unknown/confirmed
-状态。
+OT 前停止。普通 pull/push/sync 的传输层始终使用最小字符级 diff，不扩大评论
+或修订锚点；review 则在这些原子 diff 之上增加独立的语义规划层。新 review 默认
+采用 adaptive 粒度：单个连续改动保持原样，同一单词内的碎片改动会合并，短语内
+足够密集的多个改动也可合并，但不会跨越 LaTeX 命令、花括号、数学边界、注释、
+换行或句子边界。用户也可在 `begin` 时选择 exact、word 或 sentence。
+
+提交时，本地各文件的提案 hash、粒度、算法版本和语义计划 hash 被冻结，重试必须
+重新得到同一份计划；文本差异随后使用 tracked OT 发送。`review diff` 同时报告
+面向审阅的 hunk 数量和底层原子修改数量。显式 change ID 不存在时，以完整
+tracked-change JSON 的稳定 hash 作为本地身份。操作仍经过 SQLite receipt 的
+prepared/inflight/unknown/confirmed 状态。
 
 `review status` 检查项目中的全部同步文档，而不只检查本次改过的文件。只有本次
 change 的修订和其他修订均已消失、提交后的本地文件未再修改、且没有不确定回执

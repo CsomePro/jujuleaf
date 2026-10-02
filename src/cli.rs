@@ -18,7 +18,7 @@ use crate::compile::{build_compile_report, has_output};
 use crate::doctor;
 use crate::jj::JjWorkspace;
 use crate::operations::{
-    BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, TextSelector,
+    BuildOptions, Change, HISTORY_OT, InputChange, LEGACY_OT, ReviewGranularity, TextSelector,
     apply_legacy_operations, build_document_operations, changes_for_text, locate_text,
     parse_document_snapshot, slice_utf16, utf16_len, validate_history_operations,
     visible_to_source_position,
@@ -796,6 +796,9 @@ enum Command {
         /// Description attached to the new Jujutsu work change.
         #[arg(short, long)]
         message: String,
+        /// Tracked-change grouping: adaptive keeps single edits exact while combining dense rewrites.
+        #[arg(long, value_enum, default_value_t = ReviewGranularity::Adaptive)]
+        granularity: ReviewGranularity,
         /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
         path: PathBuf,
@@ -1897,10 +1900,14 @@ pub async fn run() -> Result<()> {
             }
         },
         Command::Git { command } => dispatch_git(command, pretty).await,
-        Command::Begin { message, path } => {
+        Command::Begin {
+            message,
+            granularity,
+            path,
+        } => {
             let root = discover_root(path)?;
             let _lock = WorkspaceOperationLock::acquire(&root, "begin")?;
-            output(begin_review(&root, &message).await?, pretty)
+            output(begin_review(&root, &message, granularity).await?, pretty)
         }
         Command::Review {
             command: ReviewCommand::Abort { path },
@@ -2940,8 +2947,29 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.command,
-            Command::Begin { message, path }
-                if message == "rewrite introduction" && path.as_path() == Path::new("paper")
+            Command::Begin {
+                message,
+                granularity: ReviewGranularity::Adaptive,
+                path,
+            } if message == "rewrite introduction" && path.as_path() == Path::new("paper")
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "begin",
+            "--message",
+            "literal fixes",
+            "--granularity",
+            "exact",
+            "paper",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Begin {
+                granularity: ReviewGranularity::Exact,
+                ..
+            }
         ));
 
         for subcommand in ["diff", "status", "finish", "abort"] {

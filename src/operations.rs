@@ -1,10 +1,34 @@
 use anyhow::{Result, anyhow, bail, ensure};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 
 pub const LEGACY_OT: &str = "sharejs-text-ot";
 pub const HISTORY_OT: &str = "history-ot";
+pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v1";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewGranularity {
+    #[default]
+    Exact,
+    Adaptive,
+    Word,
+    Sentence,
+}
+
+impl std::fmt::Display for ReviewGranularity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Exact => "exact",
+            Self::Adaptive => "adaptive",
+            Self::Word => "word",
+            Self::Sentence => "sentence",
+        };
+        formatter.write_str(value)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +55,14 @@ pub struct InputChange {
     pub insert: Option<String>,
     #[serde(default)]
     pub expect: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedTextChange {
+    pub change: InputChange,
+    pub atomic_change_count: usize,
+    pub removed: usize,
+    pub inserted: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +172,243 @@ pub fn minimal_text_changes(before: &str, after: &str) -> Vec<InputChange> {
         &mut inserted,
     );
     changes
+}
+
+fn change_end(change: &InputChange) -> usize {
+    change.to.unwrap_or(change.from)
+}
+
+fn contains_review_barrier(text: &str) -> bool {
+    text.chars().any(|character| {
+        matches!(
+            character,
+            '\\' | '{'
+                | '}'
+                | '$'
+                | '%'
+                | '&'
+                | '#'
+                | '^'
+                | '~'
+                | '\n'
+                | '\r'
+                | '.'
+                | '?'
+                | '!'
+                | ';'
+                | '。'
+                | '？'
+                | '！'
+                | '；'
+        )
+    })
+}
+
+fn position_is_in_tex_command(before: &str, position: usize) -> Result<bool> {
+    let prefix = slice_utf16(before, 0, position)?;
+    let mut characters = prefix.chars().rev();
+    for character in characters.by_ref() {
+        if !(character.is_alphabetic() || character == '@') {
+            return Ok(character == '\\');
+        }
+    }
+    Ok(false)
+}
+
+fn protected_review_atom(before: &str, change: &InputChange) -> Result<bool> {
+    let removed = change.expect.as_deref().unwrap_or_default();
+    let inserted = change.insert.as_deref().unwrap_or_default();
+    Ok(contains_review_barrier(removed)
+        || contains_review_barrier(inserted)
+        || position_is_in_tex_command(before, change.from)?)
+}
+
+fn word_internal_gap(gap: &str) -> bool {
+    !gap.is_empty()
+        && gap.chars().all(|character| {
+            (character.is_alphanumeric() && !uses_dictionary_word_boundaries(character))
+                || matches!(character, '_' | '-' | '\'' | '’')
+        })
+}
+
+fn uses_dictionary_word_boundaries(character: char) -> bool {
+    matches!(
+        character as u32,
+        0x1100..=0x11ff
+            | 0x3040..=0x30ff
+            | 0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+    )
+}
+
+fn planned_atom(change: InputChange) -> PlannedTextChange {
+    PlannedTextChange {
+        removed: utf16_len(change.expect.as_deref().unwrap_or_default()),
+        inserted: utf16_len(change.insert.as_deref().unwrap_or_default()),
+        change,
+        atomic_change_count: 1,
+    }
+}
+
+fn merge_review_cluster(before: &str, atoms: &[PlannedTextChange]) -> Result<PlannedTextChange> {
+    ensure!(!atoms.is_empty(), "cannot merge an empty review cluster");
+    if atoms.len() == 1 {
+        return Ok(atoms[0].clone());
+    }
+
+    let from = atoms[0].change.from;
+    let to = change_end(&atoms[atoms.len() - 1].change);
+    let mut insert = String::new();
+    let mut previous_end = from;
+    for atom in atoms {
+        ensure!(
+            atom.change.from >= previous_end,
+            "review changes overlap while grouping"
+        );
+        insert.push_str(slice_utf16(before, previous_end, atom.change.from)?);
+        insert.push_str(atom.change.insert.as_deref().unwrap_or_default());
+        previous_end = change_end(&atom.change);
+    }
+
+    Ok(PlannedTextChange {
+        change: InputChange {
+            from,
+            to: Some(to),
+            insert: Some(insert),
+            expect: Some(slice_utf16(before, from, to)?.to_owned()),
+        },
+        atomic_change_count: atoms.iter().map(|atom| atom.atomic_change_count).sum(),
+        removed: atoms.iter().map(|atom| atom.removed).sum(),
+        inserted: atoms.iter().map(|atom| atom.inserted).sum(),
+    })
+}
+
+fn safe_review_segments<'a>(
+    before: &str,
+    atoms: &'a [PlannedTextChange],
+) -> Result<Vec<&'a [PlannedTextChange]>> {
+    if atoms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut segments = Vec::new();
+    let mut start = 0;
+    for index in 0..atoms.len() {
+        let atom_is_protected = protected_review_atom(before, &atoms[index].change)?;
+        if atom_is_protected {
+            if start < index {
+                segments.push(&atoms[start..index]);
+            }
+            segments.push(&atoms[index..=index]);
+            start = index + 1;
+            continue;
+        }
+        if index + 1 == atoms.len() {
+            continue;
+        }
+        let next_is_protected = protected_review_atom(before, &atoms[index + 1].change)?;
+        let gap = slice_utf16(
+            before,
+            change_end(&atoms[index].change),
+            atoms[index + 1].change.from,
+        )?;
+        if next_is_protected || contains_review_barrier(gap) {
+            segments.push(&atoms[start..=index]);
+            start = index + 1;
+        }
+    }
+    if start < atoms.len() {
+        segments.push(&atoms[start..]);
+    }
+    Ok(segments)
+}
+
+fn group_words(before: &str, atoms: &[PlannedTextChange]) -> Result<Vec<PlannedTextChange>> {
+    if atoms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut grouped = Vec::new();
+    let mut start = 0;
+    for index in 0..atoms.len().saturating_sub(1) {
+        let gap = slice_utf16(
+            before,
+            change_end(&atoms[index].change),
+            atoms[index + 1].change.from,
+        )?;
+        if !word_internal_gap(gap) {
+            grouped.push(merge_review_cluster(before, &atoms[start..=index])?);
+            start = index + 1;
+        }
+    }
+    grouped.push(merge_review_cluster(before, &atoms[start..])?);
+    Ok(grouped)
+}
+
+fn dense_review_segment(before: &str, atoms: &[PlannedTextChange]) -> Result<bool> {
+    if atoms.len() < 3 {
+        return Ok(false);
+    }
+    let mut total_gap = 0;
+    let mut max_gap = 0;
+    for pair in atoms.windows(2) {
+        let gap = utf16_len(slice_utf16(
+            before,
+            change_end(&pair[0].change),
+            pair[1].change.from,
+        )?);
+        total_gap += gap;
+        max_gap = max_gap.max(gap);
+    }
+    let changed: usize = atoms.iter().map(|atom| atom.removed + atom.inserted).sum();
+    Ok(max_gap <= 12 && total_gap <= changed)
+}
+
+/// Plan human-reviewable changes while preserving the exact transport diff for
+/// ordinary synchronization. A single contiguous edit is never widened. Only
+/// multiple nearby atoms may be combined, and LaTeX structural boundaries are
+/// always left untouched.
+pub fn review_text_changes(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    let atoms: Vec<_> = minimal_text_changes(before, after)
+        .into_iter()
+        .map(planned_atom)
+        .collect();
+    if granularity == ReviewGranularity::Exact || atoms.len() < 2 {
+        return Ok(atoms);
+    }
+
+    let mut planned = Vec::new();
+    for segment in safe_review_segments(before, &atoms)? {
+        let protected = segment.len() == 1 && protected_review_atom(before, &segment[0].change)?;
+        match granularity {
+            ReviewGranularity::Exact => planned.extend_from_slice(segment),
+            ReviewGranularity::Word => {
+                if protected {
+                    planned.extend_from_slice(segment);
+                } else {
+                    planned.extend(group_words(before, segment)?);
+                }
+            }
+            ReviewGranularity::Sentence => {
+                planned.push(merge_review_cluster(before, segment)?);
+            }
+            ReviewGranularity::Adaptive => {
+                if !protected && dense_review_segment(before, segment)? {
+                    planned.push(merge_review_cluster(before, segment)?);
+                } else if protected {
+                    planned.extend_from_slice(segment);
+                } else {
+                    planned.extend(group_words(before, segment)?);
+                }
+            }
+        }
+    }
+    Ok(planned)
 }
 
 fn byte_index_at_utf16(text: &str, target: usize) -> Result<usize> {
@@ -909,6 +1178,108 @@ mod tests {
         assert_eq!(inputs[1].from, utf16_len(before));
         let normalized = normalize_changes(&inputs, before).unwrap();
         assert_eq!(apply_changes(before, &normalized).unwrap(), after);
+    }
+
+    fn apply_review_plan(
+        before: &str,
+        after: &str,
+        granularity: ReviewGranularity,
+    ) -> Vec<PlannedTextChange> {
+        let planned = review_text_changes(before, after, granularity).unwrap();
+        let inputs: Vec<_> = planned.iter().map(|item| item.change.clone()).collect();
+        let normalized = normalize_changes(&inputs, before).unwrap();
+        assert_eq!(apply_changes(before, &normalized).unwrap(), after);
+        planned
+    }
+
+    #[test]
+    fn review_plan_never_widens_a_single_letter_edit() {
+        for granularity in [
+            ReviewGranularity::Exact,
+            ReviewGranularity::Adaptive,
+            ReviewGranularity::Word,
+            ReviewGranularity::Sentence,
+        ] {
+            let planned = apply_review_plan("model", "models", granularity);
+            assert_eq!(planned.len(), 1);
+            assert_eq!(planned[0].change.expect.as_deref(), Some(""));
+            assert_eq!(planned[0].change.insert.as_deref(), Some("s"));
+            assert_eq!(planned[0].atomic_change_count, 1);
+        }
+    }
+
+    #[test]
+    fn review_plan_groups_fragmented_edits_inside_a_word() {
+        let planned = apply_review_plan("abcdef", "abXdeY", ReviewGranularity::Adaptive);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].atomic_change_count, 2);
+        assert_eq!(planned[0].change.expect.as_deref(), Some("cdef"));
+        assert_eq!(planned[0].change.insert.as_deref(), Some("XdeY"));
+    }
+
+    #[test]
+    fn adaptive_review_plan_groups_a_dense_phrase_rewrite() {
+        let planned = apply_review_plan(
+            "the quick brown fox",
+            "a fast red fox",
+            ReviewGranularity::Adaptive,
+        );
+        assert_eq!(planned.len(), 1);
+        assert!(planned[0].atomic_change_count >= 3);
+        assert_eq!(planned[0].change.expect.as_deref(), Some("the quick brown"));
+        assert_eq!(planned[0].change.insert.as_deref(), Some("a fast red"));
+    }
+
+    #[test]
+    fn review_plan_does_not_cross_latex_or_sentence_boundaries() {
+        let before = "alpha \\textbf{beta}. gamma";
+        let after = "ALPHA \\textit{BETA}. GAMMA";
+        for granularity in [
+            ReviewGranularity::Adaptive,
+            ReviewGranularity::Word,
+            ReviewGranularity::Sentence,
+        ] {
+            let planned = apply_review_plan(before, after, granularity);
+            assert!(planned.len() >= 4);
+            for item in planned {
+                let removed = item.change.expect.as_deref().unwrap_or_default();
+                assert!(!(removed.contains("alpha") && removed.contains("beta")));
+                assert!(!(removed.contains("beta") && removed.contains("gamma")));
+            }
+        }
+    }
+
+    #[test]
+    fn review_plan_does_not_cross_math_comments_or_lines() {
+        for (before, after) in [
+            ("alpha $x$ beta", "ALPHA $y$ BETA"),
+            ("alpha % note\nbeta", "ALPHA % NOTE\nBETA"),
+            ("alpha\nbeta", "ALPHA\nBETA"),
+        ] {
+            let planned = apply_review_plan(before, after, ReviewGranularity::Sentence);
+            assert!(planned.len() >= 2);
+            for item in planned {
+                let removed = item.change.expect.as_deref().unwrap_or_default();
+                assert!(!(removed.contains("alpha") && removed.contains("beta")));
+            }
+        }
+    }
+
+    #[test]
+    fn review_plan_preserves_utf16_coordinates_when_grouped() {
+        let before = "😀 abcdef tail";
+        let after = "😀 abXdeY tail";
+        let planned = apply_review_plan(before, after, ReviewGranularity::Word);
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].change.from, 5);
+        assert_eq!(planned[0].change.to, Some(9));
+    }
+
+    #[test]
+    fn word_review_does_not_treat_a_cjk_sentence_as_one_word() {
+        let planned = apply_review_plan("甲乙丙丁戊", "甲X丙Y戊", ReviewGranularity::Word);
+        assert_eq!(planned.len(), 2);
+        assert!(planned.iter().all(|item| item.atomic_change_count == 1));
     }
 
     #[test]
