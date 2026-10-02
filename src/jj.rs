@@ -120,6 +120,13 @@ pub struct WorkChange {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedChange {
+    pub operation_id: String,
+    pub completed_commit_id: String,
+    pub working_commit_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitRootSummary {
@@ -574,15 +581,12 @@ impl JjWorkspace {
             !branch_name.trim().is_empty(),
             "Git branch name cannot be empty"
         );
-        self.checkpoint("capture local state before git push")
+        let frozen = self
+            .freeze_for_git_push(&format!("git backup {branch_name}"))
             .await?;
         let workspace_name = self.workspace.workspace_name().to_owned();
-        let commit_id = self
-            .repo
-            .view()
-            .get_wc_commit_id(&workspace_name)
-            .cloned()
-            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let commit_id = jj_lib::backend::CommitId::try_from_hex(&frozen.completed_commit_id)
+            .expect("Jujutsu commit IDs are valid hexadecimal");
         let remote = RemoteNameBuf::from(remote_name);
         let branch = RefNameBuf::from(branch_name);
         let expected = self
@@ -646,6 +650,55 @@ impl JjWorkspace {
         };
         self.repo = repo;
         Ok(summary)
+    }
+
+    /// Capture the latest files, keep that exact tree as a stable parent, and
+    /// move the same workspace to a blank child before a Git backup begins.
+    async fn freeze_for_git_push(&mut self, fallback_description: &str) -> Result<FinishedChange> {
+        let workspace_name = self.workspace.workspace_name().to_owned();
+        let current_commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let current_commit = self
+            .repo
+            .store()
+            .get_commit_async(&current_commit_id)
+            .await?;
+        let description = if current_commit.description().trim().is_empty() {
+            fallback_description
+        } else {
+            current_commit.description()
+        }
+        .to_owned();
+
+        self.checkpoint(&description).await?;
+        let current_commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let current_commit = self
+            .repo
+            .store()
+            .get_commit_async(&current_commit_id)
+            .await?;
+        if current_commit.description().trim().is_empty()
+            && current_commit.is_empty(self.repo.as_ref()).await?
+            && let Some(parent_commit_id) = current_commit.parent_ids().first()
+            && parent_commit_id != self.repo.store().root_commit_id()
+        {
+            return Ok(FinishedChange {
+                operation_id: self.repo.op_id().hex(),
+                completed_commit_id: parent_commit_id.hex(),
+                working_commit_id: current_commit.id().hex(),
+            });
+        }
+
+        self.finish_change(&description).await
     }
 
     pub async fn checkpoint(&mut self, description: &str) -> Result<Checkpoint> {
@@ -738,18 +791,58 @@ impl JjWorkspace {
             .await?;
 
         let workspace_name = self.workspace.workspace_name().to_owned();
-        let parent_commit_id = self
+        let current_commit_id = self
             .repo
             .view()
             .get_wc_commit_id(&workspace_name)
             .cloned()
             .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
-        let parent_commit = self
+        let current_commit = self
             .repo
             .store()
-            .get_commit_async(&parent_commit_id)
+            .get_commit_async(&current_commit_id)
             .await
             .context("failed to load Jujutsu working-copy commit")?;
+
+        // A completed review leaves a blank child as the next working-copy
+        // change. Reuse that change instead of stacking another empty commit.
+        if current_commit.description().trim().is_empty()
+            && current_commit.is_empty(self.repo.as_ref()).await?
+            && let Some(parent_commit_id) = current_commit.parent_ids().first().cloned()
+        {
+            let locked_workspace = self
+                .workspace
+                .start_working_copy_mutation()
+                .await
+                .context("failed to lock Jujutsu working copy")?;
+            let mut transaction = self.repo.start_transaction();
+            transaction.set_workspace_name(&workspace_name);
+            let described_commit = transaction
+                .repo_mut()
+                .rewrite_commit(&current_commit)
+                .set_description(description)
+                .write()
+                .await
+                .context("failed to describe Jujutsu work change")?;
+            transaction
+                .repo_mut()
+                .set_wc_commit(workspace_name, described_commit.id().clone())?;
+            transaction.repo_mut().rebase_descendants().await?;
+            let repo = transaction
+                .commit(format!("jujuleaf begin: {description}"))
+                .await
+                .context("failed to publish Jujutsu work change")?;
+            locked_workspace.finish(repo.op_id().clone()).await?;
+
+            let change = WorkChange {
+                operation_id: repo.op_id().hex(),
+                commit_id: described_commit.id().hex(),
+                parent_commit_id: parent_commit_id.hex(),
+                description: description.to_owned(),
+            };
+            self.repo = repo;
+            return Ok(change);
+        }
 
         let mut locked_workspace = self
             .workspace
@@ -760,7 +853,7 @@ impl JjWorkspace {
         transaction.set_workspace_name(&workspace_name);
         let new_commit = transaction
             .repo_mut()
-            .new_commit(vec![parent_commit.id().clone()], parent_commit.tree())
+            .new_commit(vec![current_commit.id().clone()], current_commit.tree())
             .set_description(description)
             .write()
             .await
@@ -782,11 +875,89 @@ impl JjWorkspace {
         let change = WorkChange {
             operation_id: repo.op_id().hex(),
             commit_id: new_commit.id().hex(),
-            parent_commit_id: parent_commit.id().hex(),
+            parent_commit_id: current_commit.id().hex(),
             description: description.to_owned(),
         };
         self.repo = repo;
         Ok(change)
+    }
+
+    /// Finish the current described change and move the workspace to a fresh
+    /// blank child. Retrying after the child was created is a no-op.
+    pub async fn finish_change(&mut self, description: &str) -> Result<FinishedChange> {
+        let description = description.trim();
+        ensure!(!description.is_empty(), "work description cannot be empty");
+        self.checkpoint(description).await?;
+
+        let workspace_name = self.workspace.workspace_name().to_owned();
+        let current_commit_id = self
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Jujutsu workspace has no working-copy commit"))?;
+        let current_commit = self
+            .repo
+            .store()
+            .get_commit_async(&current_commit_id)
+            .await?;
+
+        if current_commit.description().trim().is_empty()
+            && current_commit.is_empty(self.repo.as_ref()).await?
+            && let Some(parent_commit_id) = current_commit.parent_ids().first()
+        {
+            let parent_commit = self.repo.store().get_commit_async(parent_commit_id).await?;
+            if parent_commit.description() == description {
+                return Ok(FinishedChange {
+                    operation_id: self.repo.op_id().hex(),
+                    completed_commit_id: parent_commit.id().hex(),
+                    working_commit_id: current_commit.id().hex(),
+                });
+            }
+        }
+
+        let completed = self.describe_change(description).await?;
+        let completed_commit_id = jj_lib::backend::CommitId::try_from_hex(&completed.commit_id)
+            .expect("Jujutsu commit IDs are valid hexadecimal");
+        let completed_commit = self
+            .repo
+            .store()
+            .get_commit_async(&completed_commit_id)
+            .await?;
+        let mut locked_workspace = self
+            .workspace
+            .start_working_copy_mutation()
+            .await
+            .context("failed to lock Jujutsu working copy")?;
+        let mut transaction = self.repo.start_transaction();
+        transaction.set_workspace_name(&workspace_name);
+        let working_commit = transaction
+            .repo_mut()
+            .new_commit(vec![completed_commit.id().clone()], completed_commit.tree())
+            .write()
+            .await
+            .context("failed to create the next Jujutsu working change")?;
+        transaction
+            .repo_mut()
+            .set_wc_commit(workspace_name, working_commit.id().clone())?;
+        let repo = transaction
+            .commit(format!("jujuleaf finish: {description}"))
+            .await
+            .context("failed to finish Jujutsu work change")?;
+        locked_workspace
+            .locked_wc()
+            .check_out(&working_commit)
+            .await
+            .context("failed to check out the next Jujutsu working change")?;
+        locked_workspace.finish(repo.op_id().clone()).await?;
+
+        let finished = FinishedChange {
+            operation_id: repo.op_id().hex(),
+            completed_commit_id: completed_commit.id().hex(),
+            working_commit_id: working_commit.id().hex(),
+        };
+        self.repo = repo;
+        Ok(finished)
     }
 
     /// Snapshot pending files and set the current work change description.
@@ -1345,6 +1516,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finish_freezes_work_and_begin_reuses_the_blank_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
+        let file = temp.path().join("main.tex");
+        std::fs::write(&file, "base").unwrap();
+        workspace.checkpoint("synchronized base").await.unwrap();
+        workspace
+            .begin_change("rewrite introduction")
+            .await
+            .unwrap();
+        std::fs::write(&file, "reviewed result").unwrap();
+        workspace.checkpoint("rewrite introduction").await.unwrap();
+
+        let finished = workspace
+            .finish_change("rewrite introduction")
+            .await
+            .unwrap();
+        let workspace_name = workspace.workspace.workspace_name().to_owned();
+        let working_id = workspace
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .unwrap();
+        let working = workspace
+            .repo
+            .store()
+            .get_commit_async(working_id)
+            .await
+            .unwrap();
+        assert_eq!(working.id().hex(), finished.working_commit_id);
+        assert_eq!(working.description(), "");
+        assert!(working.is_empty(workspace.repo.as_ref()).await.unwrap());
+        assert_eq!(working.parent_ids()[0].hex(), finished.completed_commit_id);
+        let blank_change_id = working.change_id().clone();
+
+        let retried = workspace
+            .finish_change("rewrite introduction")
+            .await
+            .unwrap();
+        assert_eq!(retried, finished);
+
+        let next = workspace.begin_change("revise conclusion").await.unwrap();
+        let next_commit_id = workspace
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .unwrap();
+        let next_commit = workspace
+            .repo
+            .store()
+            .get_commit_async(next_commit_id)
+            .await
+            .unwrap();
+        assert_eq!(next.parent_commit_id, finished.completed_commit_id);
+        assert_eq!(next_commit.change_id(), &blank_change_id);
+        assert_eq!(next_commit.description(), "revise conclusion");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "reviewed result");
+    }
+
+    #[tokio::test]
     async fn abandon_change_restores_the_synchronized_parent() {
         let temp = tempfile::tempdir().unwrap();
         let mut workspace = JjWorkspace::init(temp.path()).await.unwrap();
@@ -1459,14 +1690,49 @@ mod tests {
         let source = tempfile::tempdir().unwrap();
         let mut source_workspace = JjWorkspace::init(source.path()).await.unwrap();
         std::fs::write(source.path().join("main.tex"), "hello from JujuLeaf\n").unwrap();
-        let checkpoint = source_workspace.checkpoint("initial paper").await.unwrap();
+        source_workspace.checkpoint("initial paper").await.unwrap();
+        source_workspace
+            .begin_change("reviewed draft")
+            .await
+            .unwrap();
+        std::fs::write(source.path().join("main.tex"), "reviewed paper\n").unwrap();
+        source_workspace
+            .finish_change("reviewed draft")
+            .await
+            .unwrap();
+        std::fs::write(
+            source.path().join("main.tex"),
+            "current uncheckpointed backup\n",
+        )
+        .unwrap();
         source_workspace
             .git_remote_add("origin", &remote.path().to_string_lossy())
             .await
             .unwrap();
         let push = source_workspace.git_push("origin", "main").await.unwrap();
         assert!(push.success, "rejected refs: {:?}", push.rejected);
-        assert_eq!(push.commit_id, checkpoint.commit_id);
+
+        let workspace_name = source_workspace.workspace.workspace_name().to_owned();
+        let working_commit_id = source_workspace
+            .repo
+            .view()
+            .get_wc_commit_id(&workspace_name)
+            .unwrap();
+        let working_commit = source_workspace
+            .repo
+            .store()
+            .get_commit_async(working_commit_id)
+            .await
+            .unwrap();
+        assert_ne!(working_commit.id().hex(), push.commit_id);
+        assert_eq!(working_commit.parent_ids()[0].hex(), push.commit_id);
+        assert!(
+            working_commit
+                .is_empty(source_workspace.repo.as_ref())
+                .await
+                .unwrap()
+        );
+        assert_eq!(working_commit.description(), "");
 
         let remote_commit = std::process::Command::new("git")
             .arg("--git-dir")
@@ -1477,7 +1743,18 @@ mod tests {
         assert!(remote_commit.status.success());
         assert_eq!(
             String::from_utf8(remote_commit.stdout).unwrap().trim(),
-            checkpoint.commit_id
+            push.commit_id
+        );
+        let remote_contents = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(remote.path())
+            .args(["show", "main:main.tex"])
+            .output()
+            .unwrap();
+        assert!(remote_contents.status.success());
+        assert_eq!(
+            String::from_utf8(remote_contents.stdout).unwrap(),
+            "current uncheckpointed backup\n"
         );
 
         let destination = tempfile::tempdir().unwrap();

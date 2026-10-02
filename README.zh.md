@@ -208,7 +208,9 @@ jujuleaf review finish
 ~~~
 
 JujuLeaf 会让审阅始终绑定到同步时的基线，并在结束前报告外来改动或只处理了
-一部分的修订。
+一部分的修订。成功结束后，最终审阅结果会保留为稳定的父 change，同时在同一个
+workspace 中留下新的空 working-copy change。下一次 `begin` 会直接复用它，不会
+创建另一个 workspace，也不会额外堆叠空 change。
 
 新建 review 默认使用 `adaptive` 粒度：像 `model` → `models` 这样只增加一个
 `s` 的修改仍然只产生一个字符的修订；同一个单词或短语内密集、碎片化的修改会
@@ -244,8 +246,8 @@ jujuleaf begin -m "重写段落" --granularity sentence
 | 比较本地与远端状态 | <code>jujuleaf status</code> |
 | 拉取、推送或同步 | <code>jujuleaf pull</code>、<code>jujuleaf push</code>、<code>jujuleaf sync</code> |
 | 查看并解决冲突 | <code>jujuleaf conflict list</code>、<code>jujuleaf conflict show PATH</code>、<code>jujuleaf conflict resolve PATH</code> |
-| 查看本地历史 | <code>jujuleaf local log</code>、<code>jujuleaf local show REVISION</code>、<code>jujuleaf local diff</code> |
-| 显示当前提交图 | <code>jujuleaf</code> |
+| 显示当前 change 图 | <code>jujuleaf log</code> 或 <code>jujuleaf</code> |
+| 查看 operation 日志 | <code>jujuleaf op log</code>、<code>jujuleaf op show REVISION</code>、<code>jujuleaf op diff</code> |
 | 通过 Git 分享历史 | <code>jujuleaf git remote add origin URL</code>、<code>jujuleaf git fetch</code>、<code>jujuleaf git push</code> |
 | 检查环境与登录状态 | <code>jujuleaf doctor</code>、<code>jujuleaf auth status</code> |
 | 恢复本地历史 | <code>jujuleaf undo</code>、<code>jujuleaf redo</code> |
@@ -356,28 +358,36 @@ jujuleaf conflict resolve main.tex --merged ./main.merged.tex
 好的合并文件。解决冲突时会创建可恢复的 Jujutsu checkpoint，并推进已观察到的
 远端基线；下一次 push 仍会在写入前重新核对实时远端状态。
 
-### 查看与恢复本地历史
+### 查看 change 与 operation 日志
 
-JujuLeaf 可以直接查看内嵌的 Jujutsu operation 历史：
+change 图用于展示完成的 Review 等稳定工作边界：
 
 ~~~bash
-jujuleaf local log
-jujuleaf local show OPERATION_ID
-jujuleaf local diff
-jujuleaf local restore OPERATION_ID
+jujuleaf log
 ~~~
 
-`local show` 接受 operation 或 commit ID 前缀，也可以用 `@` 表示当前 operation。
-`local restore` 会把目标 tree 恢复成一个新的 operation，因此恢复本身仍可撤销，
-后续历史也不会被抹掉。JujuLeaf 内嵌 jj-lib，无需额外安装或调用 `jj` 可执行文件。
+operation 日志用于展示轻量 checkpoint 和恢复点：
+
+~~~bash
+jujuleaf op log
+jujuleaf op show OPERATION_ID
+jujuleaf op diff
+jujuleaf op restore OPERATION_ID
+~~~
+
+`op show` 接受 operation 或 commit ID 前缀，也可以用 `@` 表示当前 operation。
+`op restore` 会把目标 tree 恢复成一个新的 operation，因此恢复本身仍可撤销，后续
+历史也不会被抹掉。旧的 `local` 命令仍作为兼容别名保留。JujuLeaf 内嵌 jj-lib，
+无需额外安装或调用 `jj` 可执行文件。
 
 在 clone 内不带子命令运行 `jujuleaf`，会先 snapshot 尚未记录的工作区改动，然后
-显示类似 `jj` 默认视图的紧凑彩色 first-parent 提交图。默认最多显示 10 条提交；
-operation 历史请用 `local log`，完整结构化提交数据请用 `jujuleaf --raw`。
+显示与 `jujuleaf log`、`jj` 默认视图类似的紧凑彩色 first-parent 提交图。默认最多
+显示 10 个 change；operation 历史请用 `op log`，完整结构化提交数据请用
+`jujuleaf log --raw`。
 
 紧凑提交图使用与 jj 相似的 8 位显示 ID；其他人类可读输出会把 Jujutsu
 operation、commit 和 change ID 缩写为 12 位前缀。这个前缀可以直接传给
-`local show` 和 `local restore`；如果极少数情况下发生歧义，JujuLeaf 会要求
+`op show` 和 `op restore`；如果极少数情况下发生歧义，JujuLeaf 会要求
 提供更长的前缀。`--raw` 和 `--pretty` JSON 始终保留完整 ID。
 
 ### 通过 Git 分享同一份历史
@@ -393,10 +403,12 @@ jujuleaf git fetch --remote origin
 jujuleaf git remote list
 ~~~
 
-`git push` 会先记录尚未 checkpoint 的文件，再把当前 Jujutsu working-copy commit
-发布到指定分支，默认分支为 `main`。它把最后一次 fetch 到的远端位置作为 lease；
-如果远端出现预期外的新提交，push 会拒绝覆盖。更新已有分支前应先运行
-`git fetch`。Fetch 会把远端分支和 tag 导入 Jujutsu 历史，但不会替换当前工作副本。
+`git push` 会先记录全部尚未 checkpoint 的文件，把这一准确状态保留为稳定的父
+change，再让同一个 workspace 移到新的空 child，最后把冻结的父 commit 发布到
+指定分支，默认分支为 `main`。后续修改会继续写入 child，不会改写已经备份的版本。
+它把最后一次 fetch 到的远端位置作为 lease；如果远端出现预期外的新提交，push
+会拒绝覆盖，但已冻结的本地状态仍可恢复。更新已有分支前应先运行 `git fetch`。
+Fetch 会把远端分支和 tag 导入 Jujutsu 历史，但目前不会替换或自动合并当前工作副本。
 
 Remote 配置还支持 `remote remove`、`remote rename` 和 `remote set-url`。在 clone
 外运行时用 `-R PATH` 指定工作区。工作区仍由 `jujuleaf clone` 创建，不使用

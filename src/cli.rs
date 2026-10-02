@@ -748,10 +748,25 @@ enum Command {
         #[command(subcommand)]
         command: ConflictCommand,
     },
-    /// Browse, compare, and restore JujuLeaf's local Jujutsu history.
+    /// Show the current Jujutsu change graph.
+    Log {
+        /// Maximum number of changes to show.
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Local JujuLeaf workspace or a path inside it.
+        #[arg(default_value = ".")]
+        path: PathBuf,
+    },
+    /// Inspect and restore the Jujutsu operation journal.
+    Op {
+        #[command(subcommand)]
+        command: OperationCommand,
+    },
+    /// Compatibility alias for operation-history commands; prefer `op`.
+    #[command(hide = true)]
     Local {
         #[command(subcommand)]
-        command: LocalCommand,
+        command: OperationCommand,
     },
     /// Interoperate with Git through the embedded Jujutsu repository.
     #[command(
@@ -963,7 +978,7 @@ impl ConflictResolveArgs {
 }
 
 #[derive(Subcommand)]
-enum LocalCommand {
+enum OperationCommand {
     /// List recent local Jujutsu operations, newest first.
     Log {
         /// Maximum number of operations to show.
@@ -995,7 +1010,7 @@ enum LocalCommand {
     },
     /// Restore files from a previous operation as a new recoverable operation.
     Restore {
-        /// Operation or commit ID prefix shown by local log.
+        /// Operation or commit ID prefix shown by op log.
         revision: String,
         /// Local JujuLeaf clone or a path inside it.
         #[arg(default_value = ".")]
@@ -1038,7 +1053,7 @@ enum GitCommand {
         #[command(flatten)]
         repository: GitRepositoryArgs,
     },
-    /// Push the current Jujutsu working-copy commit as a Git branch.
+    /// Freeze the latest files, start a blank child, and push the frozen commit.
     Push {
         /// Git remote to push to.
         #[arg(long, default_value = "origin")]
@@ -1709,6 +1724,40 @@ async fn dispatch_git(command: GitCommand, mode: OutputMode) -> Result<()> {
     }
 }
 
+async fn dispatch_operation(command: OperationCommand, mode: OutputMode) -> Result<()> {
+    match command {
+        OperationCommand::Log { limit, path } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "op log")?;
+            let workspace = JjWorkspace::open(root).await?;
+            output(workspace.history(limit).await?, mode)
+        }
+        OperationCommand::Show {
+            revision,
+            internal,
+            path,
+        } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "op show")?;
+            let workspace = JjWorkspace::open(root).await?;
+            output(workspace.show(&revision, internal).await?, mode)
+        }
+        OperationCommand::Diff { internal, path } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "op diff")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.working_diff(internal).await?, mode)
+        }
+        OperationCommand::Restore { revision, path } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "op restore")?;
+            ensure_sync_allowed(&root, "op restore")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            output(workspace.restore(&revision).await?, mode)
+        }
+    }
+}
+
 pub async fn run() -> Result<()> {
     let current_dir = std::env::current_dir()?;
     let prepared = prepare_cli_args(std::env::args_os(), &current_dir)?;
@@ -1737,6 +1786,13 @@ pub async fn run() -> Result<()> {
             let _lock = WorkspaceOperationLock::acquire(&root, "workspace log")?;
             let mut workspace = JjWorkspace::open(root).await?;
             let summary = workspace.workspace_log(10).await?;
+            output_workspace_log(&summary, pretty)
+        }
+        Command::Log { limit, path } => {
+            let root = discover_root(path)?;
+            let _lock = WorkspaceOperationLock::acquire(&root, "log")?;
+            let mut workspace = JjWorkspace::open(root).await?;
+            let summary = workspace.workspace_log(limit).await?;
             output_workspace_log(&summary, pretty)
         }
         Command::Login {
@@ -1868,37 +1924,9 @@ pub async fn run() -> Result<()> {
                 }
             }
         }
-        Command::Local { command } => match command {
-            LocalCommand::Log { limit, path } => {
-                let root = discover_root(path)?;
-                let _lock = WorkspaceOperationLock::acquire(&root, "local log")?;
-                let workspace = JjWorkspace::open(root).await?;
-                output(workspace.history(limit).await?, pretty)
-            }
-            LocalCommand::Show {
-                revision,
-                internal,
-                path,
-            } => {
-                let root = discover_root(path)?;
-                let _lock = WorkspaceOperationLock::acquire(&root, "local show")?;
-                let workspace = JjWorkspace::open(root).await?;
-                output(workspace.show(&revision, internal).await?, pretty)
-            }
-            LocalCommand::Diff { internal, path } => {
-                let root = discover_root(path)?;
-                let _lock = WorkspaceOperationLock::acquire(&root, "local diff")?;
-                let mut workspace = JjWorkspace::open(root).await?;
-                output(workspace.working_diff(internal).await?, pretty)
-            }
-            LocalCommand::Restore { revision, path } => {
-                let root = discover_root(path)?;
-                let _lock = WorkspaceOperationLock::acquire(&root, "local restore")?;
-                ensure_sync_allowed(&root, "local restore")?;
-                let mut workspace = JjWorkspace::open(root).await?;
-                output(workspace.restore(&revision).await?, pretty)
-            }
-        },
+        Command::Op { command } | Command::Local { command } => {
+            dispatch_operation(command, pretty).await
+        }
         Command::Git { command } => dispatch_git(command, pretty).await,
         Command::Begin {
             message,
@@ -2506,6 +2534,8 @@ async fn dispatch_authenticated(
             }
         }
         Command::WorkspaceLog
+        | Command::Log { .. }
+        | Command::Op { .. }
         | Command::Login { .. }
         | Command::Profile { .. }
         | Command::Auth { .. }
@@ -2689,7 +2719,21 @@ mod tests {
         assert!(matches!(
             cli.command,
             Command::Local {
-                command: LocalCommand::Show { internal: true, .. }
+                command: OperationCommand::Show { internal: true, .. }
+            }
+        ));
+
+        let cli = Cli::try_parse_from(["jujuleaf", "log", "--limit", "25", "./paper"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Log { limit: 25, ref path } if path == Path::new("./paper")
+        ));
+
+        let cli = Cli::try_parse_from(["jujuleaf", "op", "show", "@", "--internal"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Op {
+                command: OperationCommand::Show { internal: true, .. }
             }
         ));
     }

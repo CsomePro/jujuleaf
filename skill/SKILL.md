@@ -202,8 +202,9 @@ jujuleaf begin -m 'Start the next coherent change' --raw
 
 Interpret the boundary as `synchronized parent -> described child work`.
 `begin` requires a clean synchronized baseline with no pending tracked
-changes, then creates a new described Jujutsu child. It is the work boundary;
-`checkpoint` only snapshots the current child and does not start another one.
+changes, then creates a described Jujutsu child or reuses the fresh blank child
+left by the previous successful finish. It is the work boundary; `checkpoint`
+only snapshots the current child and does not start another one.
 New review work defaults to `--granularity adaptive`: keep an isolated edit
 exact, but combine multiple fragmented edits inside one word or a dense phrase
 into a readable tracked-change hunk. Use `--granularity exact` for strictly
@@ -229,7 +230,8 @@ Apply these review rules:
   thread commands. Comments are reconciled by `review finish`.
 - Run `review finish` only after every tracked change in the project is
   accepted or rejected. It takes the reviewed remote text as final, pulls all
-  remote state, preserves the work description, and closes the review state.
+  remote state, preserves the completed change and its description, moves the
+  same workspace to a fresh blank child, and closes the review state.
 - If a multi-document submission stops after at least one remote attempt,
   inspect the `unsubmittedFiles` from `review status`, resolve every tracked
   change already present in Overleaf, and run `review finish`. Finishing reports
@@ -276,12 +278,13 @@ Use these commands deliberately:
   overwriting concurrent local changes.
 - Run `push` only for intentionally direct publication outside a review.
 - Run `checkpoint` to snapshot the current work, not to create a work boundary.
-- Run `local log`, `local show REVISION`, and `local diff` to inspect embedded
-  Jujutsu history. Prefer these read-only commands before a restoration.
-- Run `jujuleaf` without a subcommand for the compact current first-parent
-  commit graph. It snapshots pending working-copy changes; use `jujuleaf --raw`
-  when structured full commit IDs are needed.
-- Run `local restore REVISION` to restore a selected tree as a new recoverable
+- Run `jujuleaf log` for the current Jujutsu change graph. Running `jujuleaf`
+  without a subcommand is the compact default form. Both snapshot pending
+  working-copy changes; use `jujuleaf log --raw` for full commit IDs.
+- Run `op log`, `op show REVISION`, and `op diff` to inspect the operation
+  journal and lightweight checkpoints before a restoration. The old `local`
+  forms remain compatibility aliases.
+- Run `op restore REVISION` to restore a selected tree as a new recoverable
   operation; do not assume it erases later history.
 - Run `undo` and `redo` for JujuLeaf-managed local history outside an active
   review; do not manipulate the internal `.jj` repository directly.
@@ -306,13 +309,16 @@ configuration. Outside the clone, add `-R PATH`. Create a JujuLeaf workspace
 with `jujuleaf clone`; there is no separate `jujuleaf git clone` or `git init`
 flow.
 
-`git push` checkpoints pending files and publishes the current Jujutsu
-working-copy commit. It uses the last fetched remote position as a lease. If a
+`git push` checkpoints pending files, freezes that exact state as a stable
+parent change, moves the same workspace to a fresh blank child, and publishes
+the frozen parent. It uses the last fetched remote position as a lease. If a
 remote branch may already exist or has advanced, fetch it before pushing and do
-not bypass a rejection. `git fetch` imports remote history but does not check it
-out into the working copy. These mutating Git commands are blocked during an
-active review. Let the system Git executable use its configured SSH agent or
-credential helper; never expose credentials in command arguments or output.
+not bypass a rejection. A rejected network push does not discard the frozen
+local state. `git fetch` imports remote history but does not check it out or
+merge it into the working copy yet. These mutating Git commands are blocked
+during an active review. Let the system Git executable use its configured SSH
+agent or credential helper; never expose credentials in command arguments or
+output.
 
 The compact graph uses jj-style 8-character display IDs. Other human output
 abbreviates Jujutsu IDs to unambiguous-looking 12-character prefixes. Agent

@@ -331,7 +331,9 @@ prepared/inflight/unknown/confirmed 状态。
 change 的修订和其他修订均已消失、提交后的本地文件未再修改、且没有不确定回执
 时，`readyToFinish` 才为 true。状态结果同时列出未提交文件和不确定回执数量。
 `review finish` 以审阅后的远端正文为最终结果：接受、拒绝及审阅者后续编辑都会
-被拉回当前 change，然后保留原 description 并清除 review 状态。提交时的提案
+被拉回当前 change，然后保留原 description，将完成结果留作稳定父 change，并把
+同一 workspace 移到一个新的空 working-copy child，最后清除 review 状态。下一次
+`begin` 会复用并描述这个空 child，不会创建额外 workspace 或空层。提交时的提案
 仍可从 Jujutsu operation 历史恢复。
 
 多文档提交若在至少一次远端尝试后中止，状态保持为 `submitting`。用户先在
@@ -356,12 +358,18 @@ CLI 不按每个键盘事件建历史。一个显式 checkpoint、pull 或 push 
 恢复前一 operation 的 tree；`redo` 恢复 undo 前保存的 operation。整个过程不
 调用外部 `jj` 命令。
 
-`local log` 沿 Jujutsu operation 父链列出 checkpoint，`local show` 按 operation
-或 commit ID 前缀展示文件变更和 unified diff，`local diff` 先捕获当前工作副本
-再展示未 checkpoint 的变更。`local restore` 把指定 operation 的 tree 写成新的
+`log` 展示当前 Jujutsu change 的 first-parent 图；`op log` 沿 Jujutsu operation
+父链列出 checkpoint，`op show` 按 operation 或 commit ID 前缀展示文件变更和
+unified diff，`op diff` 先捕获当前工作副本再展示未 checkpoint 的变更。
+`op restore` 把指定 operation 的 tree 写成新的
 operation，而不是移动或删除历史指针，所以恢复动作本身可继续 undo，也能再次
 找到恢复之后的版本。默认隐藏 `.jujuleaf` 审计元数据，只有显式 `--internal`
-才会显示。
+才会显示。旧的 `local` 命令保留为兼容别名。
+
+`git push` 会先 snapshot 全部待记录文件，将当前状态固定为父 change，再把同一个
+workspace 移到新的空 child，最后推送被冻结的父 commit。后续本地修改只会重写
+child；即使网络 push 被 lease 或连接错误拒绝，本地固定版本仍留在 change 图和
+operation 历史中。`git fetch` 当前只导入远端提交与 bookmark，尚不自动合并。
 
 clone 根目录的 `.jujuleafignore` 使用 gitignore 语法。规则同时作用于工作区新文件
 扫描和 Jujutsu 新文件跟踪，但不会取消跟踪已经同步的 Overleaf 实体。无论规则

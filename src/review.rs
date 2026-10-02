@@ -1429,7 +1429,7 @@ pub async fn finish_review_with_api(
         "review result was preserved locally, but final pull reported a conflict"
     );
     let mut workspace = JjWorkspace::open(root).await?;
-    let described = workspace.describe_change(&state.description).await?;
+    let finished = workspace.finish_change(&state.description).await?;
     clear_state(root)?;
 
     Ok(ReviewFinishSummary {
@@ -1438,7 +1438,7 @@ pub async fn finish_review_with_api(
         description: state.description,
         reviewed_files,
         unsubmitted_files,
-        jj_operation_id: described.operation_id,
+        jj_operation_id: finished.operation_id,
         pull,
     })
 }

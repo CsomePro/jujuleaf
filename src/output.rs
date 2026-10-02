@@ -738,7 +738,7 @@ pub(crate) fn render_workspace_log(summary: &WorkspaceLogSummary, color: bool) -
                 "{}  {}",
                 paint("~", Tone::Dim, color),
                 paint(
-                    "older commits omitted; use `jujuleaf local log`",
+                    "older changes omitted; increase `jujuleaf log --limit`",
                     Tone::Dim,
                     color
                 )

@@ -216,7 +216,10 @@ jujuleaf review finish
 ~~~
 
 JujuLeaf keeps the review anchored to its synchronized baseline and reports
-foreign or partially resolved changes before closing it.
+foreign or partially resolved changes before closing it. A successful finish
+keeps the reconciled review as a stable parent change and leaves a fresh empty
+working-copy change for the next edit. The next `begin` reuses that empty
+change; it does not create another workspace or an extra empty layer.
 
 New reviews use `adaptive` granularity: an isolated edit such as adding the
 `s` in `model` → `models` remains a one-character tracked change, while a
@@ -254,8 +257,8 @@ submissions verify the persisted plan before retrying.
 | Compare local and remote state | <code>jujuleaf status</code> |
 | Pull, push, or synchronize | <code>jujuleaf pull</code>, <code>jujuleaf push</code>, <code>jujuleaf sync</code> |
 | Inspect and resolve conflicts | <code>jujuleaf conflict list</code>, <code>jujuleaf conflict show PATH</code>, <code>jujuleaf conflict resolve PATH</code> |
-| Inspect local history | <code>jujuleaf local log</code>, <code>jujuleaf local show REVISION</code>, <code>jujuleaf local diff</code> |
-| Show the current commit graph | <code>jujuleaf</code> |
+| Show the current change graph | <code>jujuleaf log</code> or <code>jujuleaf</code> |
+| Inspect the operation journal | <code>jujuleaf op log</code>, <code>jujuleaf op show REVISION</code>, <code>jujuleaf op diff</code> |
 | Share through Git | <code>jujuleaf git remote add origin URL</code>, <code>jujuleaf git fetch</code>, <code>jujuleaf git push</code> |
 | Check setup and authentication | <code>jujuleaf doctor</code>, <code>jujuleaf auth status</code> |
 | Restore local history | <code>jujuleaf undo</code>, <code>jujuleaf redo</code> |
@@ -377,31 +380,39 @@ and `--merged` installs a file you prepared. Resolution creates a recoverable
 Jujutsu checkpoint and advances the observed remote baseline; the next push
 still verifies the live remote state before writing.
 
-### Inspect and restore local history
+### Inspect changes and the operation journal
 
-JujuLeaf exposes the embedded Jujutsu operation history directly:
+The change graph contains durable work boundaries such as completed reviews:
 
 ~~~bash
-jujuleaf local log
-jujuleaf local show OPERATION_ID
-jujuleaf local diff
-jujuleaf local restore OPERATION_ID
+jujuleaf log
 ~~~
 
-`local show` accepts an operation or commit ID prefix, or `@` for the current
-operation. `local restore` restores that tree as a new operation, so the restore
-itself can be undone and does not erase later history. JujuLeaf embeds jj-lib;
+The operation journal contains lightweight checkpoints and recovery points:
+
+~~~bash
+jujuleaf op log
+jujuleaf op show OPERATION_ID
+jujuleaf op diff
+jujuleaf op restore OPERATION_ID
+~~~
+
+`op show` accepts an operation or commit ID prefix, or `@` for the current
+operation. `op restore` restores that tree as a new operation, so the restore
+itself can be undone and does not erase later history. The previous `local`
+commands remain accepted as compatibility aliases. JujuLeaf embeds jj-lib;
 installing or invoking the separate `jj` executable is not required.
 
 Inside a clone, running `jujuleaf` without a subcommand snapshots pending
 working-copy changes and displays a compact, colored first-parent commit graph,
-similar to the default `jj` view. It shows up to 10 commits; use `local log` for
-operation history and `jujuleaf --raw` for the full structured commit data.
+similar to `jujuleaf log` and the default `jj` view. It shows up to 10 changes;
+use `op log` for operation history and `jujuleaf log --raw` for full structured
+commit data.
 
 The compact graph uses jj-style 8-character display IDs. Elsewhere,
 human-readable output abbreviates Jujutsu operation, commit, and change IDs to
-a 12-character prefix. These prefixes can be passed back to `local show` and
-`local restore`; if one is ever ambiguous, JujuLeaf asks for a longer prefix.
+a 12-character prefix. These prefixes can be passed back to `op show` and
+`op restore`; if one is ever ambiguous, JujuLeaf asks for a longer prefix.
 `--raw` and `--pretty` JSON always retain the complete IDs.
 
 ### Share the same history through Git
@@ -418,12 +429,15 @@ jujuleaf git fetch --remote origin
 jujuleaf git remote list
 ~~~
 
-`git push` snapshots pending files and publishes the current Jujutsu
-working-copy commit under the selected branch (default: `main`). It uses the
-last fetched remote position as a lease, so an unexpected remote update is
-rejected instead of overwritten. Run `git fetch` first when updating an
+`git push` first snapshots every pending file, keeps that exact state as a
+stable parent change, moves the same workspace to a fresh blank child, and
+publishes the frozen parent under the selected branch (default: `main`). Later
+edits therefore continue in the child without rewriting the Git backup. It uses
+the last fetched remote position as a lease, so an unexpected remote update is
+rejected instead of overwritten; the frozen local state remains recoverable
+even when the network push fails. Run `git fetch` first when updating an
 existing branch. Fetch imports remote branches and tags into Jujutsu history;
-it does not replace the working copy.
+it does not replace or automatically merge the working copy yet.
 
 Remote configuration also supports `remote remove`, `remote rename`, and
 `remote set-url`. Use `-R PATH` when running outside the clone. Create the
