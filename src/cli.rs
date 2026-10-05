@@ -811,7 +811,7 @@ enum Command {
         /// Description attached to the new Jujutsu work change.
         #[arg(short, long)]
         message: String,
-        /// Tracked-change grouping: adaptive keeps single edits exact while combining dense rewrites.
+        /// Tracked-change grouping: adaptive scans LaTeX blocks and keeps small edits exact.
         #[arg(long, value_enum, default_value_t = ReviewGranularity::Adaptive)]
         granularity: ReviewGranularity,
         /// Local JujuLeaf clone or a path inside it.

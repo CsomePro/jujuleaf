@@ -317,9 +317,18 @@ sync → begin → draft → review submit → submitting → submitted → fini
 正文 hash 和 comments/tracked-change metadata hash。任何并发变化都会在发送
 OT 前停止。普通 pull/push/sync 的传输层始终使用最小字符级 diff，不扩大评论
 或修订锚点；review 则在这些原子 diff 之上增加独立的语义规划层。新 review 默认
-采用 adaptive 粒度：单个连续改动保持原样，同一单词内的碎片改动会合并，短语内
-足够密集的多个改动也可合并，但不会跨越 LaTeX 命令、花括号、数学边界、注释、
-换行或句子边界。用户也可在 `begin` 时选择 exact、word 或 sentence。
+采用 adaptive 粒度。semantic-v2 先通过 LaTeX block scanner 生成带类型和字节范围
+的逻辑块：正文在花括号和数学状态之外按句子切分；list 环境按同级、多行
+`\item` 切分并保留嵌套内容；figure 按 includegraphics、caption 和 subfigure
+组件切分，label 跟随相邻组件；table/tabular、展示数学、verbatim/listing/minted
+代码和 TikZ/PGF 图形作为不可拆原子块。文本容器递归扫描，未知命令、自定义环境、
+环境错配或不闭合定界符标记为低置信度，并回退到与 semantic-v1 相同的保守分组路径。
+
+scanner 只决定结构边界，随后动态规划在保持顺序和连续性的前提下，以词汇重叠、
+长度差和块类型匹配对齐两侧逻辑块。大型结构重写由此避免字符级 LCS 把命令和
+无关单词切碎；较小的独立改动仍保留最小范围。用户也可在 `begin` 时选择
+exact、word 或 sentence。已经开始的 semantic-v1 review 继续使用旧规划器，缺少
+算法字段的早期状态也按 v1 恢复。
 
 提交时，本地各文件的提案 hash、粒度、算法版本和语义计划 hash 被冻结，重试必须
 重新得到同一份计划；文本差异随后使用 tracked OT 发送。`review diff` 同时报告

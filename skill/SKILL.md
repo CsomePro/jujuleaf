@@ -205,12 +205,17 @@ Interpret the boundary as `synchronized parent -> described child work`.
 changes, then creates a described Jujutsu child or reuses the fresh blank child
 left by the previous successful finish. It is the work boundary; `checkpoint`
 only snapshots the current child and does not start another one.
-New review work defaults to `--granularity adaptive`: keep an isolated edit
-exact, but combine multiple fragmented edits inside one word or a dense phrase
-into a readable tracked-change hunk. Use `--granularity exact` for strictly
-literal review atoms, `word` for word-local grouping, or `sentence` only when
-the user explicitly wants broader prose review. Ordinary `sync` and `push`
-always retain exact character-level transport changes.
+New review work defaults to `--granularity adaptive`. Its LaTeX block
+scanner aligns prose sentences and complete multiline list items, separates
+figure images and captions while preserving labels, and treats tables,
+display math, code listings, and TikZ drawings as protected atomic blocks.
+Unknown commands, custom environments, and malformed structures use the
+conservative fallback planner. Dense word or phrase rewrites may still be
+grouped, while small isolated edits retain their minimal range. Use
+`--granularity exact` for strictly literal review atoms, `word` for word-local
+grouping, or `sentence` only when the user explicitly wants broader prose
+review. Ordinary `sync` and `push` always retain exact character-level
+transport changes.
 
 Apply these review rules:
 

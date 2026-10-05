@@ -7,6 +7,7 @@ pub mod doctor;
 pub(crate) mod file_util;
 pub mod ignore;
 pub mod jj;
+pub(crate) mod latex_blocks;
 pub mod operations;
 pub mod output;
 pub(crate) mod platform;

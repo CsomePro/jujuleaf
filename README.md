@@ -221,11 +221,18 @@ keeps the reconciled review as a stable parent change and leaves a fresh empty
 working-copy change for the next edit. The next `begin` reuses that empty
 change; it does not create another workspace or an extra empty layer.
 
-New reviews use `adaptive` granularity: an isolated edit such as adding the
-`s` in `model` → `models` remains a one-character tracked change, while a
-dense rewrite inside one word or phrase is presented as one review hunk.
-Ordinary `sync` and `push` always keep their exact character-level transport
-diff so comment anchors and concurrent edits are not widened.
+New reviews use `adaptive` granularity. A lightweight LaTeX block scanner
+aligns prose sentences and complete multiline list items, separates figure
+images from captions while keeping labels attached, and protects tables,
+display math, code listings, and TikZ drawings as atomic review blocks.
+Unknown commands, custom environments, and malformed structures fall back to
+the conservative diff planner instead of being guessed.
+
+Dense rewrites inside a word or phrase are also grouped into readable hunks.
+Small isolated edits still keep their minimal range—for example, `model` →
+`models` marks only the added `s`. Ordinary `sync` and `push` always keep their
+exact character-level transport diff so comment anchors and concurrent edits
+are not widened.
 
 Choose a different review policy when starting the work:
 

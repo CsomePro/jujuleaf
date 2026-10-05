@@ -11,8 +11,9 @@ use crate::auth::Session;
 use crate::file_util::atomic_write;
 use crate::jj::JjWorkspace;
 use crate::operations::{
-    BuildOptions, DocumentState, HISTORY_OT, REVIEW_DIFF_ALGORITHM, ReviewGranularity,
-    build_document_operations, parse_document_snapshot, review_text_changes, slice_utf16,
+    BuildOptions, DocumentState, HISTORY_OT, LEGACY_REVIEW_DIFF_ALGORITHM, REVIEW_DIFF_ALGORITHM,
+    ReviewGranularity, build_document_operations, parse_document_snapshot,
+    review_text_changes_for_algorithm, slice_utf16, supported_review_diff_algorithm,
 };
 use crate::platform::workspace_path;
 use crate::project::{DocumentRef, collect_entities, connect_project_with_api};
@@ -60,7 +61,7 @@ struct ReviewDocument {
 }
 
 fn default_review_diff_algorithm() -> String {
-    REVIEW_DIFF_ALGORITHM.to_owned()
+    LEGACY_REVIEW_DIFF_ALGORITHM.to_owned()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -437,7 +438,7 @@ fn validate_binding(
 
 fn require_supported_diff_algorithm(state: &ReviewState) -> Result<()> {
     ensure!(
-        state.diff_algorithm == REVIEW_DIFF_ALGORITHM,
+        supported_review_diff_algorithm(&state.diff_algorithm),
         "review work uses unsupported diff algorithm '{}'; update JujuLeaf or abort this unsubmitted review",
         state.diff_algorithm
     );
@@ -484,11 +485,12 @@ fn review_change_location(content: &str, position: usize) -> Result<(usize, usiz
 }
 
 fn review_plan_hash(
+    algorithm: &str,
     granularity: ReviewGranularity,
     changes: &[crate::operations::InputChange],
 ) -> Result<String> {
     Ok(bytes_hash(&serde_json::to_vec(&json!({
-        "algorithm": REVIEW_DIFF_ALGORITHM,
+        "algorithm": algorithm,
         "granularity": granularity,
         "changes": changes,
     }))?))
@@ -747,7 +749,12 @@ pub async fn review_diff_with_api(
             baseline.path
         );
         let local = read_document(root, &baseline.path)?;
-        let planned = review_text_changes(&remote.content, &local, state.granularity)?;
+        let planned = review_text_changes_for_algorithm(
+            &remote.content,
+            &local,
+            state.granularity,
+            &state.diff_algorithm,
+        )?;
         if planned.is_empty() {
             continue;
         }
@@ -1019,7 +1026,12 @@ pub async fn submit_review_with_api(
             "local file changed after review submission started: {}",
             baseline.path
         );
-        let planned = review_text_changes(&document_state.content, &local, state.granularity)?;
+        let planned = review_text_changes_for_algorithm(
+            &document_state.content,
+            &local,
+            state.granularity,
+            &state.diff_algorithm,
+        )?;
         if planned.is_empty() {
             unchanged.push(baseline.path);
             socket.leave_doc(&document.id).await.ok();
@@ -1027,7 +1039,7 @@ pub async fn submit_review_with_api(
         }
         let changes: Vec<_> = planned.iter().map(|item| item.change.clone()).collect();
         let atomic_change_count = planned.iter().map(|item| item.atomic_change_count).sum();
-        let plan_hash = review_plan_hash(state.granularity, &changes)?;
+        let plan_hash = review_plan_hash(&state.diff_algorithm, state.granularity, &changes)?;
         if let Some(expected) = &baseline.plan_hash {
             ensure!(
                 expected == &plan_hash,
@@ -1513,7 +1525,27 @@ mod tests {
 
         let decoded: ReviewState = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.granularity, ReviewGranularity::Exact);
-        assert_eq!(decoded.diff_algorithm, REVIEW_DIFF_ALGORITHM);
+        assert_eq!(decoded.diff_algorithm, LEGACY_REVIEW_DIFF_ALGORITHM);
+    }
+
+    #[test]
+    fn in_flight_legacy_review_algorithm_remains_supported() {
+        let mut legacy = test_state(ReviewPhase::Submitting);
+        legacy.diff_algorithm = LEGACY_REVIEW_DIFF_ALGORITHM.into();
+        assert!(require_supported_diff_algorithm(&legacy).is_ok());
+
+        let current_hash =
+            review_plan_hash(REVIEW_DIFF_ALGORITHM, ReviewGranularity::Adaptive, &[]).unwrap();
+        let legacy_hash = review_plan_hash(
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+            ReviewGranularity::Adaptive,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(current_hash, legacy_hash);
+
+        legacy.diff_algorithm = "semantic-v999".into();
+        assert!(require_supported_diff_algorithm(&legacy).is_err());
     }
 
     #[test]

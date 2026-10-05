@@ -1,12 +1,17 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use similar::{ChangeTag, TextDiff};
 
+use crate::latex_blocks::{LatexBlock, scan_latex_blocks};
+
 pub const LEGACY_OT: &str = "sharejs-text-ot";
 pub const HISTORY_OT: &str = "history-ot";
-pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v1";
+pub const LEGACY_REVIEW_DIFF_ALGORITHM: &str = "semantic-v1";
+pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v2";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -365,25 +370,259 @@ fn dense_review_segment(before: &str, atoms: &[PlannedTextChange]) -> Result<boo
     Ok(max_gap <= 12 && total_gap <= changed)
 }
 
-/// Plan human-reviewable changes while preserving the exact transport diff for
-/// ordinary synchronization. A single contiguous edit is never widened. Only
-/// multiple nearby atoms may be combined, and LaTeX structural boundaries are
-/// always left untouched.
-pub fn review_text_changes(
+fn review_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\\' {
+            while characters
+                .peek()
+                .is_some_and(|next| next.is_alphabetic() || *next == '@')
+            {
+                characters.next();
+            }
+            continue;
+        }
+        if character.is_alphanumeric() {
+            token.extend(character.to_lowercase());
+        } else if !token.is_empty() {
+            if !matches!(token.as_str(), "itemize" | "enumerate" | "description") {
+                tokens.push(std::mem::take(&mut token));
+            } else {
+                token.clear();
+            }
+        }
+    }
+    if !token.is_empty() && !matches!(token.as_str(), "itemize" | "enumerate" | "description") {
+        tokens.push(token);
+    }
+    tokens
+}
+
+fn lexical_partition_score(source: &str, target: &str) -> i64 {
+    if source == target {
+        return 1_000_000;
+    }
+    let source_tokens = review_tokens(source);
+    let target_tokens = review_tokens(target);
+    if source_tokens.is_empty() || target_tokens.is_empty() {
+        return -500;
+    }
+    let mut counts = BTreeMap::new();
+    for token in &source_tokens {
+        *counts.entry(token).or_insert(0usize) += 1;
+    }
+    let mut shared = 0usize;
+    for token in &target_tokens {
+        if let Some(count) = counts.get_mut(token)
+            && *count > 0
+        {
+            *count -= 1;
+            shared += 1;
+        }
+    }
+    let total = source_tokens.len() + target_tokens.len();
+    let dice = (2_000 * shared / total) as i64;
+    let length_delta = source_tokens.len().abs_diff(target_tokens.len()) as i64;
+    dice + shared as i64 * 25 - length_delta * 2
+}
+
+fn block_partition_score(source: &[LatexBlock], target: &LatexBlock) -> i64 {
+    if target.kind.is_structured() {
+        if source.iter().any(|block| block.kind == target.kind) {
+            750
+        } else {
+            -750
+        }
+    } else if source.iter().any(|block| block.kind.is_structured()) {
+        -150
+    } else {
+        0
+    }
+}
+
+fn chunk_group_text<'a>(text: &'a str, chunks: &[LatexBlock]) -> &'a str {
+    let first = chunks.first().expect("review chunk group is not empty");
+    let last = chunks.last().expect("review chunk group is not empty");
+    &text[first.byte_from..last.byte_to]
+}
+
+/// Partition a longer sequence into one non-empty contiguous group per item in
+/// a shorter sequence. Lexical overlap chooses human-meaningful boundaries;
+/// every byte remains assigned exactly once.
+fn best_review_partition(
+    source_text: &str,
+    source: &[LatexBlock],
+    targets_text: &str,
+    targets: &[LatexBlock],
+) -> Vec<usize> {
+    debug_assert!(source.len() >= targets.len());
+    debug_assert!(!targets.is_empty());
+    let source_len = source.len();
+    let target_len = targets.len();
+    let mut scores = vec![vec![i64::MIN; source_len + 1]; target_len + 1];
+    let mut previous = vec![vec![0usize; source_len + 1]; target_len + 1];
+    scores[0][0] = 0;
+
+    for target_index in 1..=target_len {
+        let min_end = target_index;
+        let max_end = source_len - (target_len - target_index);
+        for end in min_end..=max_end {
+            for start in target_index - 1..end {
+                let prior = scores[target_index - 1][start];
+                if prior == i64::MIN {
+                    continue;
+                }
+                let source_group = chunk_group_text(source_text, &source[start..end]);
+                let target =
+                    chunk_group_text(targets_text, &targets[target_index - 1..target_index]);
+                let role_score =
+                    block_partition_score(&source[start..end], &targets[target_index - 1]);
+                let candidate = prior + lexical_partition_score(source_group, target) + role_score;
+                if candidate > scores[target_index][end] {
+                    scores[target_index][end] = candidate;
+                    previous[target_index][end] = start;
+                }
+            }
+        }
+    }
+
+    let mut boundaries = vec![0usize; target_len + 1];
+    boundaries[target_len] = source_len;
+    for target_index in (1..=target_len).rev() {
+        boundaries[target_index - 1] = previous[target_index][boundaries[target_index]];
+    }
+    boundaries
+}
+
+fn structured_replacement(
     before: &str,
     after: &str,
-    granularity: ReviewGranularity,
-) -> Result<Vec<PlannedTextChange>> {
-    let atoms: Vec<_> = minimal_text_changes(before, after)
-        .into_iter()
-        .map(planned_atom)
-        .collect();
-    if granularity == ReviewGranularity::Exact || atoms.len() < 2 {
-        return Ok(atoms);
+    old_chunks: &[LatexBlock],
+    new_chunks: &[LatexBlock],
+) -> PlannedTextChange {
+    let old = chunk_group_text(before, old_chunks);
+    let new = chunk_group_text(after, new_chunks);
+    let from = utf16_len(&before[..old_chunks[0].byte_from]);
+    let to = from + utf16_len(old);
+    PlannedTextChange {
+        change: InputChange {
+            from,
+            to: Some(to),
+            insert: Some(new.to_owned()),
+            expect: Some(old.to_owned()),
+        },
+        atomic_change_count: minimal_text_changes(old, new).len().max(1),
+        removed: utf16_len(old),
+        inserted: utf16_len(new),
+    }
+}
+
+fn structural_review_changes(
+    before: &str,
+    after: &str,
+    atomic_change_count: usize,
+) -> Option<Vec<PlannedTextChange>> {
+    const MIN_STRUCTURAL_ATOMS: usize = 8;
+    const MAX_STRUCTURAL_BLOCKS: usize = 64;
+
+    if atomic_change_count < MIN_STRUCTURAL_ATOMS {
+        return None;
+    }
+
+    let old_scan = scan_latex_blocks(before);
+    let new_scan = scan_latex_blocks(after);
+    if !old_scan.valid || !new_scan.valid {
+        return None;
+    }
+
+    let mut prefix = 0;
+    while prefix < old_scan.blocks.len()
+        && prefix < new_scan.blocks.len()
+        && chunk_group_text(before, &old_scan.blocks[prefix..=prefix])
+            == chunk_group_text(after, &new_scan.blocks[prefix..=prefix])
+    {
+        prefix += 1;
+    }
+    let mut old_end = old_scan.blocks.len();
+    let mut new_end = new_scan.blocks.len();
+    while old_end > prefix
+        && new_end > prefix
+        && chunk_group_text(before, &old_scan.blocks[old_end - 1..old_end])
+            == chunk_group_text(after, &new_scan.blocks[new_end - 1..new_end])
+    {
+        old_end -= 1;
+        new_end -= 1;
+    }
+
+    let old_blocks = &old_scan.blocks[prefix..old_end];
+    let new_blocks = &new_scan.blocks[prefix..new_end];
+    if old_blocks.is_empty()
+        || new_blocks.is_empty()
+        || old_blocks.len() > MAX_STRUCTURAL_BLOCKS
+        || new_blocks.len() > MAX_STRUCTURAL_BLOCKS
+        || old_blocks.iter().any(|block| block.kind.is_unknown())
+        || new_blocks.iter().any(|block| block.kind.is_unknown())
+    {
+        return None;
+    }
+
+    let structure_changed = old_scan.signature != new_scan.signature;
+    let changed_structured_block = old_blocks
+        .iter()
+        .chain(new_blocks)
+        .any(|block| block.kind.is_structured());
+    if !structure_changed && !changed_structured_block {
+        return None;
     }
 
     let mut planned = Vec::new();
-    for segment in safe_review_segments(before, &atoms)? {
+    if old_blocks.len() >= new_blocks.len() {
+        let boundaries = best_review_partition(before, old_blocks, after, new_blocks);
+        for (index, new_block) in new_blocks.iter().enumerate() {
+            let old_group = &old_blocks[boundaries[index]..boundaries[index + 1]];
+            let old = chunk_group_text(before, old_group);
+            let new = chunk_group_text(after, std::slice::from_ref(new_block));
+            if old != new {
+                planned.push(structured_replacement(
+                    before,
+                    after,
+                    old_group,
+                    std::slice::from_ref(new_block),
+                ));
+            }
+        }
+    } else {
+        let boundaries = best_review_partition(after, new_blocks, before, old_blocks);
+        for (index, old_block) in old_blocks.iter().enumerate() {
+            let new_group = &new_blocks[boundaries[index]..boundaries[index + 1]];
+            let old = chunk_group_text(before, std::slice::from_ref(old_block));
+            let new = chunk_group_text(after, new_group);
+            if old != new {
+                planned.push(structured_replacement(
+                    before,
+                    after,
+                    std::slice::from_ref(old_block),
+                    new_group,
+                ));
+            }
+        }
+    }
+    Some(planned)
+}
+
+fn group_review_atoms(
+    before: &str,
+    atoms: &[PlannedTextChange],
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    if granularity == ReviewGranularity::Exact || atoms.len() < 2 {
+        return Ok(atoms.to_vec());
+    }
+
+    let mut planned = Vec::new();
+    for segment in safe_review_segments(before, atoms)? {
         let protected = segment.len() == 1 && protected_review_atom(before, &segment[0].change)?;
         match granularity {
             ReviewGranularity::Exact => planned.extend_from_slice(segment),
@@ -411,6 +650,55 @@ pub fn review_text_changes(
     Ok(planned)
 }
 
+/// Plan human-reviewable changes while preserving the exact transport diff for
+/// ordinary synchronization. A single contiguous edit is never widened. Only
+/// multiple nearby atoms may be combined. Large changes are scanned into
+/// LaTeX-aware prose, list, figure, table, math, code, and drawing blocks before
+/// alignment, while small edits retain exact character ranges.
+pub fn review_text_changes(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    let atoms: Vec<_> = minimal_text_changes(before, after)
+        .into_iter()
+        .map(planned_atom)
+        .collect();
+    if matches!(
+        granularity,
+        ReviewGranularity::Adaptive | ReviewGranularity::Sentence
+    ) && let Some(planned) = structural_review_changes(before, after, atoms.len())
+    {
+        return Ok(planned);
+    }
+    group_review_atoms(before, &atoms, granularity)
+}
+
+pub fn review_text_changes_for_algorithm(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+    algorithm: &str,
+) -> Result<Vec<PlannedTextChange>> {
+    match algorithm {
+        REVIEW_DIFF_ALGORITHM => review_text_changes(before, after, granularity),
+        LEGACY_REVIEW_DIFF_ALGORITHM => {
+            let atoms: Vec<_> = minimal_text_changes(before, after)
+                .into_iter()
+                .map(planned_atom)
+                .collect();
+            group_review_atoms(before, &atoms, granularity)
+        }
+        _ => bail!("unsupported review diff algorithm '{algorithm}'"),
+    }
+}
+
+pub fn supported_review_diff_algorithm(algorithm: &str) -> bool {
+    matches!(
+        algorithm,
+        REVIEW_DIFF_ALGORITHM | LEGACY_REVIEW_DIFF_ALGORITHM
+    )
+}
 fn byte_index_at_utf16(text: &str, target: usize) -> Result<usize> {
     let mut units = 0;
     for (byte_index, ch) in text.char_indices() {
@@ -1228,6 +1516,226 @@ mod tests {
         assert!(planned[0].atomic_change_count >= 3);
         assert_eq!(planned[0].change.expect.as_deref(), Some("the quick brown"));
         assert_eq!(planned[0].change.insert.as_deref(), Some("a fast red"));
+    }
+
+    #[test]
+    fn adaptive_review_plan_aligns_paragraph_to_itemize_rewrites() {
+        let before = "Three challenges determine whether this observation supports a recovery method. First, the information must be absent from the passive outputs against which the method is compared. We construct score vectors with identical complete finite-precision passive outputs and retain queries that distinguish them. Second, recovery must handle an unknown tie priority and bounded biases without receiving a numerical comparison result. We derive binary queries that identify the scores exactly and bound their cost. Third, removing the dependence must occur before the operation that introduces it. We compare preprocessing orders and measure their effects on both the distinguishing queries and independently generated random biases.";
+        let after = r#"We address three questions about this numerical channel:
+\begin{itemize}
+\item \textbf{What additional information is disclosed?} We test whether chosen biases distinguish score vectors with identical complete passive outputs.
+\item \textbf{How can absolute scores be recovered?} We seek exact recovery from token responses under bounded biases and unknown tie priority.
+\item \textbf{How does processing order affect disclosure?} We compare subtraction of the maximum before and after bias addition, examining disclosure and preservation of token decisions under random biases.
+\end{itemize}"#;
+
+        let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
+        assert_eq!(planned.len(), 4);
+        assert!(
+            planned[0]
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.starts_with("Three challenges"))
+        );
+        assert!(
+            planned[0]
+                .change
+                .insert
+                .as_deref()
+                .is_some_and(|text| text.starts_with("We address"))
+        );
+        assert!(
+            planned[1]
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.contains("First,") && text.contains("We construct"))
+        );
+        assert!(
+            planned[1]
+                .change
+                .insert
+                .as_deref()
+                .is_some_and(|text| text.contains(r"\begin{itemize}") && text.contains(r"\item"))
+        );
+        assert!(
+            planned[2]
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.contains("Second,") && text.contains("We derive"))
+        );
+        assert!(
+            planned[3]
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.contains("Third,") && text.contains("We compare"))
+        );
+        assert!(
+            planned[3]
+                .change
+                .insert
+                .as_deref()
+                .is_some_and(|text| text.ends_with(r"\end{itemize}"))
+        );
+
+        let legacy = review_text_changes_for_algorithm(
+            before,
+            after,
+            ReviewGranularity::Adaptive,
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        assert!(legacy.len() > planned.len());
+    }
+
+    #[test]
+    fn adaptive_review_plan_preserves_figure_components() {
+        let before = r#"\begin{figure}
+\centering
+\includegraphics[width=.45\textwidth]{baseline-left.pdf}
+\includegraphics[width=.45\textwidth]{baseline-right.pdf}
+\caption{Baseline accuracy and latency under the original configuration.}
+\label{fig:comparison}
+\end{figure}
+"#;
+        let after = r#"\begin{figure}
+\centering
+\includegraphics[width=.48\textwidth]{revised-primary.pdf}
+\includegraphics[width=.48\textwidth]{revised-secondary.pdf}
+\caption{Revised precision and throughput under the hardened configuration.}
+\label{fig:comparison}
+\end{figure}
+"#;
+        assert!(minimal_text_changes(before, after).len() >= 8);
+        let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
+        assert_eq!(planned.len(), 3);
+        assert!(
+            planned[0]
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.contains("baseline-left.pdf"))
+        );
+        assert!(planned[1].change.expect.as_deref().is_some_and(|text| {
+            text.starts_with(r"\includegraphics") && text.contains("baseline-right.pdf")
+        }));
+        assert!(planned[2].change.expect.as_deref().is_some_and(
+            |text| text.starts_with(r"\caption")
+                && text.contains(r"\label{fig:comparison}")
+                && text.ends_with("\\end{figure}\n")
+        ));
+    }
+
+    #[test]
+    fn adaptive_review_plan_treats_protected_environments_as_atomic() {
+        let cases = [
+            (
+                r#"\begin{table}
+\begin{tabular}{ll}
+alpha & one \\
+bravo & two \\
+charlie & three \\
+delta & four \\
+echo & five \\
+foxtrot & six \\
+\end{tabular}
+\end{table}
+"#,
+                r#"\begin{table}
+\begin{tabular}{ll}
+amber & first \\
+blue & second \\
+cyan & third \\
+denim & fourth \\
+emerald & fifth \\
+fuchsia & sixth \\
+\end{tabular}
+\end{table}
+"#,
+            ),
+            (
+                r#"\begin{align}
+a_1 &= b_1 + c_1 \\
+a_2 &= b_2 + c_2 \\
+a_3 &= b_3 + c_3 \\
+a_4 &= b_4 + c_4
+\end{align}
+"#,
+                r#"\begin{align}
+x_1 &= y_1 - z_1 \\
+x_2 &= y_2 - z_2 \\
+x_3 &= y_3 - z_3 \\
+x_4 &= y_4 - z_4
+\end{align}
+"#,
+            ),
+            (
+                r#"\begin{lstlisting}
+let alpha = first();
+let bravo = second();
+let charlie = third();
+let delta = fourth();
+\end{lstlisting}
+"#,
+                r#"\begin{lstlisting}
+const amber = primary();
+const blue = secondary();
+const cyan = tertiary();
+const denim = quaternary();
+\end{lstlisting}
+"#,
+            ),
+            (
+                r#"\begin{tikzpicture}
+\draw[red] (0,0) -- (1,1);
+\draw[blue] (1,0) -- (2,1);
+\draw[green] (2,0) -- (3,1);
+\draw[black] (3,0) -- (4,1);
+\end{tikzpicture}
+"#,
+                r#"\begin{tikzpicture}
+\draw[cyan] (0,1) -- (1,2);
+\draw[magenta] (1,1) -- (2,2);
+\draw[yellow] (2,1) -- (3,2);
+\draw[gray] (3,1) -- (4,2);
+\end{tikzpicture}
+"#,
+            ),
+        ];
+
+        for (before, after) in cases {
+            assert!(minimal_text_changes(before, after).len() >= 8);
+            let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
+            assert_eq!(planned.len(), 1);
+            assert_eq!(planned[0].change.expect.as_deref(), Some(before));
+            assert_eq!(planned[0].change.insert.as_deref(), Some(after));
+        }
+    }
+
+    #[test]
+    fn adaptive_review_plan_falls_back_for_unknown_latex_environments() {
+        let before = r#"\begin{customlayout}
+alpha first beta second gamma third delta fourth.
+epsilon fifth zeta sixth eta seventh theta eighth.
+\end{customlayout}
+"#;
+        let after = r#"\begin{customlayout}
+amber primary blue secondary cyan tertiary denim quaternary.
+emerald fifth fuchsia sixth gold seventh hazel eighth.
+\end{customlayout}
+"#;
+        assert!(minimal_text_changes(before, after).len() >= 8);
+        let current = review_text_changes(before, after, ReviewGranularity::Adaptive).unwrap();
+        let legacy = review_text_changes_for_algorithm(
+            before,
+            after,
+            ReviewGranularity::Adaptive,
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        assert_eq!(current, legacy);
     }
 
     #[test]
