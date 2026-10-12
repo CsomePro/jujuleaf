@@ -178,19 +178,28 @@ jujuleaf comments get THREAD_ID --raw
 `comments inbox` returns only open comment threads that contain an actual
 message, with their anchors and bounded document context. This omits resolved
 threads and tracked-change-only review cards. Inspect the complete thread before
-editing. If its latest message already says the request was addressed and no
-newer collaborator request follows it, skip it rather than repeating the edit.
+acting. If its latest message already addresses the request and no newer
+collaborator message follows it, skip it rather than repeating the response.
 
 For every thread that the user asked you to address:
 
-1. Read the anchor, surrounding context, and all messages. If the anchor is
-   detached or the request is ambiguous, stop and ask instead of guessing.
-2. Make the requested change through the active workflow. During a local review,
-   edit the local file and use `review diff` / `review submit`; do not replace the
-   review batch with a direct remote edit.
-3. Verify that the intended change was actually applied. Compile when required
-   by the task or when the edit can affect LaTeX syntax.
-4. Only after successful verification, post one reply in the same thread:
+1. Read the anchor, surrounding context, and all messages. Determine whether the
+   thread requests a document change, asks a question or for an explanation,
+   provides information only, or combines these intents. If a location-dependent
+   request has a detached anchor or remains ambiguous, stop and ask instead of
+   guessing.
+2. For a change request, make the requested change through the active workflow.
+   During a local review, edit the local file and use `review diff` /
+   `review submit`; do not replace the review batch with a direct remote edit.
+   Verify that the intended change was actually applied, and compile when the
+   task or LaTeX syntax requires it.
+3. For a question or explanation request, inspect enough project context to give
+   a supported answer, then answer in the thread without inventing a document
+   change. For an informational note, make no change; acknowledge it only when
+   the user requested a response to every thread or an acknowledgement is useful.
+4. After completing the applicable action, post one concise response in the
+   same thread. Describe a verified edit, answer the question, or acknowledge
+   the information as appropriate:
 
 ```bash
 jujuleaf comments reply THREAD_ID \
@@ -199,11 +208,11 @@ jujuleaf comments reply THREAD_ID \
 
 Keep this acknowledgement to one short sentence, preferably at most 120
 characters; each reply is independently limited to 300 Unicode characters, and
-an open thread may receive multiple replies. State what changed, in the
-collaborator's language when practical. Do not paste a diff, compile log,
-chain-of-thought, or generic progress report. Send one reply per thread after
-the coherent change, not one per atomic edit. Do not claim success or reply when
-no effective change was made. Leave the thread open for the human reviewer
+an open thread may receive multiple replies. State what changed or answer what
+was asked, in the collaborator's language when practical. Do not paste a diff,
+compile log, chain-of-thought, or generic progress report. Send one reply after
+the coherent action, not one per atomic edit. Never claim that content changed
+when no effective change was made. Leave the thread open for the human reviewer
 unless the user explicitly asks you to resolve it.
 
 The normal `comments` namespace is the preferred interface for interactive
