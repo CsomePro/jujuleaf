@@ -163,18 +163,60 @@ jujuleaf add-comment --raw PROJECT_ID main.tex \
 jujuleaf threads PROJECT_ID --raw
 ```
 
-Inspect thread and document IDs before replying, resolving, reopening, editing,
-or deleting comments. Do not resolve or delete collaborators' threads unless the
+Inspect thread and document IDs before resolving, reopening, editing, or
+deleting comments. Do not resolve or delete collaborators' threads unless the
 user requests it.
 
-For a long-running worker or another program that needs a stable compatibility
-contract, use the versioned bridge instead of parsing `threads --raw` or the raw
-`watch` event stream:
+When the user asks to address collaborator comments, use the low-noise inbox
+instead of interpreting Overleaf's combined review feed:
+
+```bash
+jujuleaf comments inbox --raw
+jujuleaf comments get THREAD_ID --raw
+```
+
+`comments inbox` returns only open comment threads that contain an actual
+message, with their anchors and bounded document context. This omits resolved
+threads and tracked-change-only review cards. Inspect the complete thread before
+editing. If its latest message already says the request was addressed and no
+newer collaborator request follows it, skip it rather than repeating the edit.
+
+For every thread that the user asked you to address:
+
+1. Read the anchor, surrounding context, and all messages. If the anchor is
+   detached or the request is ambiguous, stop and ask instead of guessing.
+2. Make the requested change through the active workflow. During a local review,
+   edit the local file and use `review diff` / `review submit`; do not replace the
+   review batch with a direct remote edit.
+3. Verify that the intended change was actually applied. Compile when required
+   by the task or when the edit can affect LaTeX syntax.
+4. Only after successful verification, post one reply in the same thread:
+
+```bash
+jujuleaf comments reply THREAD_ID \
+  'Updated: clarified the comparison.' --raw
+```
+
+Keep this acknowledgement to one short sentence, preferably at most 120
+characters; each reply is independently limited to 300 Unicode characters, and
+an open thread may receive multiple replies. State what changed, in the
+collaborator's language when practical. Do not paste a diff, compile log,
+chain-of-thought, or generic progress report. Send one reply per thread after
+the coherent change, not one per atomic edit. Do not claim success or reply when
+no effective change was made. Leave the thread open for the human reviewer
+unless the user explicitly asks you to resolve it.
+
+The normal `comments` namespace is the preferred interface for interactive
+agents and one-off scripts. For a long-running worker or another program that
+needs a stable compatibility contract, use the versioned bridge instead of
+parsing normal command output or the raw `watch` event stream:
 
 ```bash
 jujuleaf bridge describe
 jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments inbox --protocol 1
 jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments reply THREAD_ID --message 'Updated the wording.' --protocol 1
 jujuleaf bridge comments watch --protocol 1
 ```
 

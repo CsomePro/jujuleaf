@@ -4,8 +4,9 @@
 with JujuLeaf. It hides private Overleaf HTTP, Socket.IO, ranges, history-OT,
 and cache representations behind a versioned JSON protocol.
 
-Protocol version 1 is read-only and covers comment discovery, authoritative
-thread context, and comment wake-up events.
+Protocol version 1 covers comment discovery, a low-noise comment inbox,
+authoritative thread context, concise thread replies, and comment wake-up
+events.
 
 ## Transport rules
 
@@ -110,6 +111,40 @@ Thread messages contain stable IDs, content, optional author identity, and
 RFC 3339 `createdAt`/`editedAt` timestamps. Email addresses and private raw
 Overleaf fields are not exposed.
 
+### Low-noise inbox
+
+```console
+jujuleaf bridge comments inbox --protocol 1
+```
+
+`comments.inbox` has the same snapshot shape as `comments.list`, but retains
+only open threads with at least one nonblank comment message and only documents
+referenced by those threads. It therefore omits resolved discussions, empty
+thread records, and tracked-change-only review cards from an agent's work queue.
+Detached open comments remain visible so callers can report that the requested
+location is no longer available.
+
+The inbox is not a durable task queue. A handled thread stays present until a
+human resolves it. Callers should inspect all messages and skip a thread when
+its latest acknowledgement already addresses the request and no newer request
+follows it.
+
+### Concise replies
+
+After a requested edit has been applied and verified, reply in the same thread:
+
+```console
+jujuleaf bridge comments reply THREAD_ID \
+  --message 'Updated: clarified the comparison.' --protocol 1
+```
+
+`comments.reply` rejects blank messages, resolved or missing threads, and text
+longer than 300 Unicode characters. Its result is a stable receipt containing
+the project ID, thread ID, submitted content, character count, and a message ID
+when Overleaf returns one. A successful reply does not resolve the thread.
+Because this command changes remote state, callers must not retry blindly after
+an interrupted or uncertain response; re-read the thread first.
+
 ### Anchors
 
 An attached or collapsed anchor has this form:
@@ -210,6 +245,7 @@ JUJULEAF_NOT_INITIALIZED
 AUTH_REQUIRED
 PROJECT_NOT_FOUND
 THREAD_NOT_FOUND
+INVALID_ARGUMENT
 CONNECTION_LOST
 RATE_LIMITED
 CONFLICT

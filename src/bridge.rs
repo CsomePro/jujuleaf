@@ -27,6 +27,7 @@ use crate::sync::discover_project_context;
 const PROTOCOL_NAME: &str = "jujuleaf.bridge";
 const PROTOCOL_VERSION: u32 = 1;
 const CONTEXT_UNITS: usize = 160;
+const MAX_REPLY_CHARACTERS: usize = 300;
 
 #[derive(Debug, Subcommand)]
 pub enum BridgeCommand {
@@ -52,10 +53,22 @@ impl BridgeCommand {
 pub enum BridgeCommentsCommand {
     /// Return every comment thread with normalized anchors and document snapshots.
     List(BridgeProtocolArgs),
+    /// Return open, manually-authored comment threads as a low-noise work queue.
+    Inbox(BridgeProtocolArgs),
     /// Return one authoritative comment thread context.
     Get {
         /// Stable Overleaf thread ID.
         thread_id: String,
+        #[command(flatten)]
+        protocol: BridgeProtocolArgs,
+    },
+    /// Post one concise reply to an existing open comment thread.
+    Reply {
+        /// Stable Overleaf thread ID.
+        thread_id: String,
+        /// Concise reply text, limited to 300 Unicode characters.
+        #[arg(long, value_name = "TEXT")]
+        message: String,
         #[command(flatten)]
         protocol: BridgeProtocolArgs,
     },
@@ -73,15 +86,19 @@ impl BridgeCommentsCommand {
     fn operation(&self) -> &'static str {
         match self {
             Self::List(_) => "comments.list",
+            Self::Inbox(_) => "comments.inbox",
             Self::Get { .. } => "comments.get",
+            Self::Reply { .. } => "comments.reply",
             Self::Watch { .. } => "comments.watch",
         }
     }
 
     fn protocol(&self) -> u32 {
         match self {
-            Self::List(args) => args.protocol,
-            Self::Get { protocol, .. } | Self::Watch { protocol, .. } => protocol.protocol,
+            Self::List(args) | Self::Inbox(args) => args.protocol,
+            Self::Get { protocol, .. }
+            | Self::Reply { protocol, .. }
+            | Self::Watch { protocol, .. } => protocol.protocol,
         }
     }
 }
@@ -215,6 +232,17 @@ struct ThreadContext {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CommentReplyReceipt {
+    project_id: String,
+    thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message_id: Option<String>,
+    content: String,
+    character_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CommentEvent {
     r#type: &'static str,
     project_id: String,
@@ -329,14 +357,22 @@ async fn execute(
 
             match command {
                 BridgeCommentsCommand::List(_) => {
-                    let snapshot = build_snapshot(&mut api, &project_id).await?;
-                    write_result("comments.list", snapshot)
+                    write_result("comments.list", comments_list(&mut api, &project_id).await?)
                 }
-                BridgeCommentsCommand::Get { thread_id, .. } => {
-                    let snapshot = build_snapshot(&mut api, &project_id).await?;
-                    let context = thread_context(snapshot, &thread_id)?;
-                    write_result("comments.get", context)
-                }
+                BridgeCommentsCommand::Inbox(_) => write_result(
+                    "comments.inbox",
+                    comments_inbox(&mut api, &project_id).await?,
+                ),
+                BridgeCommentsCommand::Get { thread_id, .. } => write_result(
+                    "comments.get",
+                    comments_get(&mut api, &project_id, &thread_id).await?,
+                ),
+                BridgeCommentsCommand::Reply {
+                    thread_id, message, ..
+                } => write_result(
+                    "comments.reply",
+                    comments_reply(&mut api, &project_id, &thread_id, &message).await?,
+                ),
                 BridgeCommentsCommand::Watch {
                     reconcile_interval, ..
                 } => {
@@ -366,7 +402,14 @@ fn describe() -> Value {
         "binary": {"version": env!("CARGO_PKG_VERSION")},
         "operations": {
             "comments.list": {"versions": [1], "output": "json"},
+            "comments.inbox": {"versions": [1], "output": "json"},
             "comments.get": {"versions": [1], "output": "json"},
+            "comments.reply": {
+                "versions": [1],
+                "output": "json",
+                "mutating": true,
+                "maxCharacters": MAX_REPLY_CHARACTERS
+            },
             "comments.watch": {
                 "versions": [1],
                 "output": "ndjson",
@@ -388,6 +431,11 @@ fn describe() -> Value {
                 ]
             },
             "threadContext": {"versions": [1], "multipleAnchors": true},
+            "commentInbox": {
+                "versions": [1],
+                "openOnly": true,
+                "manualThreadsOnly": true
+            },
             "skillInstall": {
                 "versions": [1],
                 "targets": [
@@ -411,6 +459,7 @@ fn describe() -> Value {
             "AUTH_REQUIRED",
             "PROJECT_NOT_FOUND",
             "THREAD_NOT_FOUND",
+            "INVALID_ARGUMENT",
             "CONNECTION_LOST",
             "RATE_LIMITED",
             "CONFLICT",
@@ -590,6 +639,110 @@ fn thread_context(mut snapshot: CommentsSnapshot, thread_id: &str) -> Result<Thr
         documents: snapshot.documents,
         thread,
     })
+}
+
+pub(crate) async fn comments_list(api: &mut OverleafApi, project_id: &str) -> Result<Value> {
+    Ok(serde_json::to_value(
+        build_snapshot(api, project_id).await?,
+    )?)
+}
+
+pub(crate) async fn comments_inbox(api: &mut OverleafApi, project_id: &str) -> Result<Value> {
+    let snapshot = build_snapshot(api, project_id).await?;
+    Ok(serde_json::to_value(comment_inbox(snapshot))?)
+}
+
+pub(crate) async fn comments_get(
+    api: &mut OverleafApi,
+    project_id: &str,
+    thread_id: &str,
+) -> Result<Value> {
+    let snapshot = build_snapshot(api, project_id).await?;
+    Ok(serde_json::to_value(thread_context(snapshot, thread_id)?)?)
+}
+
+pub(crate) async fn comments_reply(
+    api: &mut OverleafApi,
+    project_id: &str,
+    thread_id: &str,
+    message: &str,
+) -> Result<Value> {
+    let message = validate_reply(message)?;
+    let raw_threads = api.threads(project_id).await?;
+    let thread = raw_thread(&raw_threads, thread_id).ok_or_else(|| {
+        BridgeFault::new(
+            "THREAD_NOT_FOUND",
+            format!("comment thread '{thread_id}' was not found"),
+            false,
+        )
+    })?;
+    ensure!(
+        !thread
+            .get("resolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        BridgeFault::new(
+            "CONFLICT",
+            format!("comment thread '{thread_id}' is already resolved"),
+            false,
+        )
+    );
+    let response = api.send_message(project_id, thread_id, message).await?;
+    Ok(serde_json::to_value(CommentReplyReceipt {
+        project_id: project_id.to_owned(),
+        thread_id: thread_id.to_owned(),
+        message_id: response
+            .get("id")
+            .or_else(|| response.pointer("/message/id"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        content: message.to_owned(),
+        character_count: message.chars().count(),
+    })?)
+}
+
+fn comment_inbox(mut snapshot: CommentsSnapshot) -> CommentsSnapshot {
+    snapshot.threads.retain(|thread| {
+        thread.state == "open"
+            && thread
+                .messages
+                .iter()
+                .any(|message| !message.content.trim().is_empty())
+    });
+    let document_ids: HashSet<_> = snapshot
+        .threads
+        .iter()
+        .flat_map(|thread| thread.anchors.iter())
+        .map(|anchor| anchor.document_id.as_str())
+        .collect();
+    snapshot
+        .documents
+        .retain(|document| document_ids.contains(document.id.as_str()));
+    snapshot
+}
+
+fn raw_thread<'a>(raw: &'a Value, thread_id: &str) -> Option<&'a Value> {
+    raw.get("threads").unwrap_or(raw).get(thread_id)
+}
+
+fn validate_reply(message: &str) -> Result<&str> {
+    let message = message.trim();
+    ensure!(
+        !message.is_empty(),
+        BridgeFault::new("INVALID_ARGUMENT", "reply message cannot be empty", false)
+    );
+    let character_count = message.chars().count();
+    ensure!(
+        character_count <= MAX_REPLY_CHARACTERS,
+        BridgeFault::new(
+            "INVALID_ARGUMENT",
+            format!(
+                "reply message has {character_count} characters; the maximum is {MAX_REPLY_CHARACTERS}"
+            ),
+            false,
+        )
+    );
+    Ok(message)
 }
 
 fn clean_path(path: &str) -> String {
@@ -1148,6 +1301,92 @@ mod tests {
         assert_eq!(value["messages"][0]["author"]["name"], "Alice");
         assert!(value["messages"][0]["author"].get("email").is_none());
         assert!(value["messages"][0].get("editedAt").is_none());
+    }
+
+    #[test]
+    fn comment_inbox_keeps_only_open_threads_with_real_messages() {
+        let threads = normalize_threads(
+            &json!({
+                "open": {
+                    "messages": [{"id": "message-1", "content": "Please revise this."}]
+                },
+                "resolved": {
+                    "resolved": true,
+                    "messages": [{"id": "message-2", "content": "Already handled."}]
+                },
+                "change-card": {"messages": []},
+                "blank": {
+                    "messages": [{"id": "message-3", "content": "  "}]
+                }
+            }),
+            HashMap::from([(
+                "open".into(),
+                vec![CommentAnchor {
+                    document_id: "doc-1".into(),
+                    path: "main.tex".into(),
+                    state: "attached",
+                    source_range_utf16: TextRange { from: 0, to: 4 },
+                    visible_range_utf16: TextRange { from: 0, to: 4 },
+                    text: "text".into(),
+                    before: String::new(),
+                    after: String::new(),
+                }],
+            )]),
+        );
+        let inbox = comment_inbox(CommentsSnapshot {
+            project: ProjectDescriptor {
+                id: "project-1".into(),
+                name: None,
+            },
+            documents: vec![
+                DocumentSnapshot {
+                    id: "doc-1".into(),
+                    path: "main.tex".into(),
+                    remote_version: 1,
+                    content_hash: "sha256:a".into(),
+                },
+                DocumentSnapshot {
+                    id: "doc-2".into(),
+                    path: "unused.tex".into(),
+                    remote_version: 1,
+                    content_hash: "sha256:b".into(),
+                },
+            ],
+            threads,
+        });
+
+        assert_eq!(inbox.threads.len(), 1);
+        assert_eq!(inbox.threads[0].id, "open");
+        assert_eq!(inbox.documents.len(), 1);
+        assert_eq!(inbox.documents[0].id, "doc-1");
+    }
+
+    #[test]
+    fn concise_replies_are_trimmed_and_limited_by_unicode_characters() {
+        assert_eq!(
+            validate_reply("  已修改：统一了术语。  ").unwrap(),
+            "已修改：统一了术语。"
+        );
+
+        let empty = validate_reply(" \n ").unwrap_err();
+        assert_eq!(classify_error(&empty).0, "INVALID_ARGUMENT");
+
+        let maximum = "改".repeat(MAX_REPLY_CHARACTERS);
+        assert_eq!(
+            validate_reply(&maximum).unwrap().chars().count(),
+            MAX_REPLY_CHARACTERS
+        );
+
+        let too_long = "改".repeat(MAX_REPLY_CHARACTERS + 1);
+        let error = validate_reply(&too_long).unwrap_err();
+        assert_eq!(classify_error(&error).0, "INVALID_ARGUMENT");
+    }
+
+    #[test]
+    fn raw_thread_supports_wrapped_and_unwrapped_overleaf_shapes() {
+        assert!(raw_thread(&json!({"thread-1": {}}), "thread-1").is_some());
+        assert!(raw_thread(&json!({"threads": {"thread-1": {}}}), "thread-1").is_some());
+        assert!(raw_thread(&json!({"threads": {}}), "missing").is_none());
     }
 
     #[test]

@@ -270,11 +270,14 @@ fn prepare_cli_args(
         });
     };
     let Some(shape) = project_argument_shape(command) else {
-        let context_profile = if matches!(command, "bridge" | "skill") {
-            None
-        } else {
-            discover_project_context(current_dir)?.and_then(|context| context.profile)
-        };
+        let has_comment_project_override =
+            command == "comments" && project_override(&arguments)?.is_some();
+        let context_profile =
+            if matches!(command, "bridge" | "skill") || has_comment_project_override {
+                None
+            } else {
+                discover_project_context(current_dir)?.and_then(|context| context.profile)
+            };
         return Ok(PreparedCliArgs {
             arguments,
             context_profile,
@@ -346,6 +349,26 @@ fn parse_cli(arguments: Vec<OsString>) -> Cli {
         })
         .get_matches_from(arguments);
     Cli::from_arg_matches(&matches).expect("clap matches the derived CLI")
+}
+
+#[derive(Subcommand)]
+enum CommentsCommand {
+    /// List every normalized comment thread and its document context.
+    List,
+    /// List only open comment threads with actual messages.
+    Inbox,
+    /// Show one comment thread with its anchor and surrounding text.
+    Get {
+        /// Stable Overleaf thread ID.
+        thread_id: String,
+    },
+    /// Post one concise reply to an existing open comment thread.
+    Reply {
+        /// Stable Overleaf thread ID.
+        thread_id: String,
+        /// Concise reply text, limited to 300 Unicode characters.
+        message: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -608,6 +631,11 @@ enum Command {
         /// Local ZIP path.
         #[arg(short = 'o', long, default_value = "project.zip")]
         output: PathBuf,
+    },
+    /// Inspect and reply to normalized Overleaf comment threads.
+    Comments {
+        #[command(subcommand)]
+        command: CommentsCommand,
     },
     /// List comment threads and their messages for a project.
     Threads {
@@ -1515,6 +1543,20 @@ async fn root_folder(api: &mut OverleafApi, project_id: &str) -> Result<String> 
     root_folder_id(&project).ok_or_else(|| anyhow!("could not determine root folder ID"))
 }
 
+fn comments_project_id(project_override: Option<&str>, current_dir: &Path) -> Result<String> {
+    if let Some(project_id) = project_override {
+        ensure!(!project_id.trim().is_empty(), "project ID cannot be empty");
+        return Ok(project_id.to_owned());
+    }
+    discover_project_context(current_dir)?
+        .map(|context| context.project_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "no JujuLeaf project was found; run inside a clone or pass --project-id PROJECT_ID"
+            )
+        })
+}
+
 async fn edit_remote(
     command: EditorCommand,
     args: EditorArgs,
@@ -1977,7 +2019,16 @@ pub async fn run() -> Result<()> {
                 &command,
             )?;
             let (_store, session, mut api) = authenticated(&profiles, &profile).await?;
-            dispatch_authenticated(command, session, &profile, &mut api, pretty).await
+            dispatch_authenticated(
+                command,
+                session,
+                &profile,
+                &mut api,
+                pretty,
+                project_override.as_deref(),
+                &current_dir,
+            )
+            .await
         }
     }
 }
@@ -1988,6 +2039,8 @@ async fn dispatch_authenticated(
     profile: &str,
     api: &mut OverleafApi,
     pretty: OutputMode,
+    project_override: Option<&str>,
+    current_dir: &Path,
 ) -> Result<()> {
     match command {
         Command::Projects => output(api.list_projects().await?, pretty),
@@ -2222,6 +2275,25 @@ async fn dispatch_authenticated(
                 json!({"success": true, "path": path, "bytes": bytes.len()}),
                 pretty,
             )
+        }
+        Command::Comments { command } => {
+            let project_id = comments_project_id(project_override, current_dir)?;
+            match command {
+                CommentsCommand::List => {
+                    output(bridge::comments_list(api, &project_id).await?, pretty)
+                }
+                CommentsCommand::Inbox => {
+                    output(bridge::comments_inbox(api, &project_id).await?, pretty)
+                }
+                CommentsCommand::Get { thread_id } => output(
+                    bridge::comments_get(api, &project_id, &thread_id).await?,
+                    pretty,
+                ),
+                CommentsCommand::Reply { thread_id, message } => output(
+                    bridge::comments_reply(api, &project_id, &thread_id, &message).await?,
+                    pretty,
+                ),
+            }
         }
         Command::Threads { project_id } => output(api.threads(&project_id).await?, pretty),
         Command::Comment {
@@ -3059,7 +3131,110 @@ mod tests {
 
         Cli::try_parse_from(["jujuleaf", "bridge", "describe"]).unwrap();
         Cli::try_parse_from(["jujuleaf", "bridge", "comments", "list"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "bridge", "comments", "inbox"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "bridge",
+            "comments",
+            "reply",
+            "thread-1",
+            "--message",
+            "Updated the terminology.",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Bridge {
+                command: BridgeCommand::Comments {
+                    command: BridgeCommentsCommand::Reply {
+                        ref thread_id,
+                        ref message,
+                        ..
+                    }
+                }
+            } if thread_id == "thread-1" && message == "Updated the terminology."
+        ));
         Cli::try_parse_from(["jujuleaf", "bridge", "comments", "watch"]).unwrap();
+    }
+
+    #[test]
+    fn normal_comment_commands_parse_for_people_and_ad_hoc_agents() {
+        Cli::try_parse_from(["jujuleaf", "comments", "list"]).unwrap();
+        Cli::try_parse_from(["jujuleaf", "comments", "inbox", "--raw"]).unwrap();
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "comments",
+            "get",
+            "thread-1",
+            "--project-id",
+            "project-1",
+        ])
+        .unwrap();
+        assert_eq!(cli.project.as_deref(), Some("project-1"));
+        assert!(matches!(
+            cli.command,
+            Command::Comments {
+                command: CommentsCommand::Get { ref thread_id }
+            } if thread_id == "thread-1"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "comments",
+            "reply",
+            "thread-1",
+            "已修改：统一了术语。",
+            "--raw",
+        ])
+        .unwrap();
+        assert!(cli.raw);
+        assert!(matches!(
+            cli.command,
+            Command::Comments {
+                command: CommentsCommand::Reply {
+                    ref thread_id,
+                    ref message
+                }
+            } if thread_id == "thread-1" && message == "已修改：统一了术语。"
+        ));
+    }
+
+    #[test]
+    fn normal_comment_commands_resolve_the_clone_or_explicit_project() {
+        let project = tempfile::tempdir().unwrap();
+        ProjectBinding {
+            project_id: "project-one".into(),
+            base_url: "https://example.test".into(),
+            profile: "work".into(),
+        }
+        .save(project.path())
+        .unwrap();
+        let nested = project.path().join("chapters");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        assert_eq!(comments_project_id(None, &nested).unwrap(), "project-one");
+        assert_eq!(
+            comments_project_id(Some("project-two"), &nested).unwrap(),
+            "project-two"
+        );
+
+        let (_, profile) = parse_in_project(&["jujuleaf", "comments", "inbox"], &nested);
+        assert_eq!(profile.as_deref(), Some("work"));
+        let (_, profile) = parse_in_project(
+            &[
+                "jujuleaf",
+                "--project-id",
+                "project-two",
+                "comments",
+                "inbox",
+            ],
+            &nested,
+        );
+        assert!(profile.is_none());
+
+        let outside = tempfile::tempdir().unwrap();
+        assert!(comments_project_id(None, outside.path()).is_err());
     }
 
     #[test]

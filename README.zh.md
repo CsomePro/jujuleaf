@@ -243,7 +243,8 @@ jujuleaf begin -m "重写段落" --granularity sentence
 | 搜索项目快照 | <code>jujuleaf search "bibliography"</code> |
 | 精确替换文本 | <code>jujuleaf replace main.tex --old "草稿" --new "终稿"</code> |
 | 提交一处修订 | <code>jujuleaf suggest main.tex --old "草稿" --new "终稿"</code> |
-| 查看评论线程 | <code>jujuleaf threads</code> |
+| 查看待处理的协作者批注 | <code>jujuleaf comments inbox</code> |
+| 读取或回复一条批注 | <code>jujuleaf comments get THREAD_ID</code>、<code>jujuleaf comments reply THREAD_ID "已修改：……"</code> |
 | 接入外部 worker | <code>jujuleaf bridge describe</code>、<code>jujuleaf bridge comments watch</code> |
 | 安装或更新 Agent Skill | <code>jujuleaf skill install</code>、<code>jujuleaf skill update</code> |
 | 编译并查看诊断 | <code>jujuleaf compile</code> |
@@ -317,7 +318,9 @@ jujuleaf projects --pretty
 ~~~bash
 jujuleaf bridge describe
 jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments inbox --protocol 1
 jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments reply THREAD_ID --message "已修改：统一了术语。" --protocol 1
 jujuleaf bridge comments watch --protocol 1
 ~~~
 
@@ -325,6 +328,9 @@ Bridge 命令固定输出紧凑、无 ANSI 的 JSON。`comments.watch` 使用 ND
 一份权威评论快照，再进入实时事件流；它还会定期重新对账并在断线后自动重连。
 事件只用于快速唤醒：worker 收到 `comments.snapshot` 时替换已知状态，收到
 `comment.event` 后再读取 `comments.get`。
+`comments.inbox` 会过滤已解决线程和仅属于修订模式的变更卡片，让 Agent 只关注
+仍待处理的协作者批注。完成并验证修改后，`comments.reply` 可在原线程中留下简短
+说明，同时保留线程为打开状态，交由人工复核和解决。
 
 Bridge 会在 Rust 端统一关联线程消息、多范围或 detached 锚点、文档路径、UTF-16
 原始/可见坐标和内容哈希，不会泄漏 Overleaf 私有事件名或 history-OT payload。

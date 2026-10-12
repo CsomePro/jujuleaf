@@ -256,7 +256,8 @@ submissions verify the persisted plan before retrying.
 | Search a project snapshot | <code>jujuleaf search "bibliography"</code> |
 | Replace exact text | <code>jujuleaf replace main.tex --old "draft" --new "final"</code> |
 | Submit one tracked edit | <code>jujuleaf suggest main.tex --old "draft" --new "final"</code> |
-| View comment threads | <code>jujuleaf threads</code> |
+| Review open collaborator comments | <code>jujuleaf comments inbox</code> |
+| Read or reply to one comment | <code>jujuleaf comments get THREAD_ID</code>, <code>jujuleaf comments reply THREAD_ID "Updated: …"</code> |
 | Integrate an external worker | <code>jujuleaf bridge describe</code>, <code>jujuleaf bridge comments watch</code> |
 | Install or update the Agent Skill | <code>jujuleaf skill install</code>, <code>jujuleaf skill update</code> |
 | Compile and inspect diagnostics | <code>jujuleaf compile</code> |
@@ -336,7 +337,9 @@ bridge instead:
 ~~~bash
 jujuleaf bridge describe
 jujuleaf bridge comments list --protocol 1
+jujuleaf bridge comments inbox --protocol 1
 jujuleaf bridge comments get THREAD_ID --protocol 1
+jujuleaf bridge comments reply THREAD_ID --message "Updated the wording." --protocol 1
 jujuleaf bridge comments watch --protocol 1
 ~~~
 
@@ -345,6 +348,10 @@ NDJSON and starts with an authoritative comment snapshot before live events.
 It periodically emits another full snapshot, reconnects automatically, and
 uses events only as wake-up notifications. A worker should replace its known
 state on `comments.snapshot` and fetch `comments.get` after a `comment.event`.
+`comments.inbox` removes resolved and tracked-change-only review entries so an
+agent can focus on open collaborator comments. After applying and verifying a
+requested edit, `comments.reply` posts a concise acknowledgement without
+resolving the human reviewer's thread.
 
 The bridge normalizes thread messages, multi-range anchors, detached anchors,
 document paths, UTF-16 source and visible ranges, and content hashes. It does
