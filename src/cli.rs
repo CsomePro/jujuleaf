@@ -11,7 +11,7 @@ use clap::{
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 
-use crate::api::OverleafApi;
+use crate::api::{CompileRoot, OverleafApi};
 use crate::auth::{LoginPreset, ProfileStore, Session, SessionStore, interactive_login};
 use crate::bridge::{self, BridgeCommand};
 use crate::compile::{build_compile_report, has_output};
@@ -603,6 +603,9 @@ enum Command {
     Compile {
         /// Overleaf project ID.
         project_id: String,
+        /// Compile this project document instead of the saved Main document.
+        #[arg(long, value_name = "TEX_PATH")]
+        root: Option<String>,
         /// Request Overleaf's faster draft compilation mode.
         #[arg(long)]
         draft: bool,
@@ -620,6 +623,9 @@ enum Command {
     Pdf {
         /// Overleaf project ID.
         project_id: String,
+        /// Compile this project document instead of the saved Main document.
+        #[arg(long, value_name = "TEX_PATH")]
+        root: Option<String>,
         /// Local PDF path.
         #[arg(short = 'o', long, default_value = "output.pdf")]
         output: PathBuf,
@@ -1543,6 +1549,26 @@ async fn root_folder(api: &mut OverleafApi, project_id: &str) -> Result<String> 
     root_folder_id(&project).ok_or_else(|| anyhow!("could not determine root folder ID"))
 }
 
+async fn resolve_compile_root(
+    api: &mut OverleafApi,
+    project_id: &str,
+    path: Option<&str>,
+) -> Result<Option<CompileRoot>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    ensure!(!path.trim().is_empty(), "--root cannot be empty");
+    let (socket, project) = connect_project_with_api(api, project_id).await?;
+    let document =
+        find_document(&project, path).ok_or_else(|| anyhow!("root document not found: {path}"));
+    socket.close().await.ok();
+    let document = document?;
+    Ok(Some(CompileRoot {
+        document_id: document.id,
+        resource_path: document.path.trim_start_matches('/').to_owned(),
+    }))
+}
+
 fn comments_project_id(project_override: Option<&str>, current_dir: &Path) -> Result<String> {
     if let Some(project_id) = project_override {
         ensure!(!project_id.trim().is_empty(), "project ID cannot be empty");
@@ -2199,23 +2225,29 @@ async fn dispatch_authenticated(
         }
         Command::Compile {
             project_id,
+            root,
             draft,
             timeout,
             show_log,
             log_output,
         } => {
             ensure!(timeout > 0, "--timeout must be positive");
+            let root = resolve_compile_root(api, &project_id, root.as_deref()).await?;
             if matches!(pretty, OutputMode::Human { .. }) {
+                let root_note = root
+                    .as_ref()
+                    .map(|root| format!(" Root: {}.", root.resource_path))
+                    .unwrap_or_default();
                 notice(
                     &format!(
-                        "Compiling on Overleaf (timeout: {timeout}s). Diagnostics and output.log become available after the server finishes."
+                        "Compiling on Overleaf (timeout: {timeout}s).{root_note} Diagnostics and output.log become available after the server finishes."
                     ),
                     pretty,
                 );
             }
             let result = match tokio::time::timeout(
                 Duration::from_secs(timeout),
-                api.compile_detailed(&project_id, draft),
+                api.compile_detailed_with_root(&project_id, draft, root.as_ref()),
             )
             .await
             {
@@ -2258,12 +2290,21 @@ async fn dispatch_authenticated(
         }
         Command::Pdf {
             project_id,
+            root,
             output: path,
         } => {
-            let bytes = api.download_pdf(&project_id).await?;
+            let root = resolve_compile_root(api, &project_id, root.as_deref()).await?;
+            let bytes = api
+                .download_pdf_with_root(&project_id, root.as_ref())
+                .await?;
             tokio::fs::write(&path, &bytes).await?;
             output(
-                json!({"success": true, "path": path, "bytes": bytes.len()}),
+                json!({
+                    "success": true,
+                    "path": path,
+                    "bytes": bytes.len(),
+                    "root": root.map(|root| root.resource_path)
+                }),
                 pretty,
             )
         }
@@ -3028,6 +3069,8 @@ mod tests {
             "--show-log",
             "--log-output",
             "build.log",
+            "--root",
+            "chapters/appendix.tex",
         ])
         .unwrap();
         assert!(matches!(
@@ -3036,8 +3079,28 @@ mod tests {
                 timeout: 60,
                 show_log: true,
                 log_output: Some(_),
+                root: Some(ref root),
                 ..
-            }
+            } if root == "chapters/appendix.tex"
+        ));
+
+        let cli = Cli::try_parse_from([
+            "jujuleaf",
+            "pdf",
+            "project",
+            "--root",
+            "alternate.tex",
+            "--output",
+            "alternate.pdf",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Pdf {
+                root: Some(ref root),
+                ref output,
+                ..
+            } if root == "alternate.tex" && output == Path::new("alternate.pdf")
         ));
 
         let cli =

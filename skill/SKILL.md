@@ -404,7 +404,14 @@ jujuleaf pdf PROJECT_ID --output output.pdf --raw
 
 Do not claim compilation succeeded merely because the process exited. Inspect
 the returned result and diagnostics. Use `--log-output PATH` when a persistent
-log is useful for debugging.
+log is useful for debugging. The saved Overleaf Main document is used by
+default. For a one-off alternate entry point, pass `--root TEX_PATH` to either
+`compile` or `pdf`; this does not change the saved project setting:
+
+```bash
+jujuleaf compile PROJECT_ID --root appendix.tex --raw
+jujuleaf pdf PROJECT_ID --root appendix.tex --output appendix.pdf --raw
+```
 
 ## Handle conflicts and uncertain writes
 

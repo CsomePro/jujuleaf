@@ -165,12 +165,17 @@ jujuleaf files
 jujuleaf read main.tex --content-only
 jujuleaf compile
 jujuleaf compile --log-output output.log
+jujuleaf compile --root appendix.tex
+jujuleaf pdf --root appendix.tex -o appendix.pdf
 ~~~
 
 Overleaf's compile endpoint returns only after the server-side build finishes.
 JujuLeaf then downloads `output.log` and parses its diagnostics. The default
 command does not create a local log file; use `--log-output PATH` to save one
-or `--show-log` to include it in the command output.
+or `--show-log` to include it in the command output. By default, `compile`
+and `pdf` use the project's saved Main document. Pass `--root TEX_PATH` to
+compile another project document for that invocation without changing the
+saved Overleaf setting.
 
 Edit files with your usual tools, record a local checkpoint, then synchronize:
 

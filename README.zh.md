@@ -157,12 +157,16 @@ jujuleaf files
 jujuleaf read main.tex --content-only
 jujuleaf compile
 jujuleaf compile --log-output output.log
+jujuleaf compile --root appendix.tex
+jujuleaf pdf --root appendix.tex -o appendix.pdf
 ~~~
 
 Overleaf 的编译接口会在服务端构建结束后才返回。随后 JujuLeaf 才能下载
 `output.log` 并解析诊断信息。默认命令不会在本地生成日志文件；如需保存，
 请使用 `--log-output PATH`，如需将完整日志包含在命令输出中，请使用
-`--show-log`。
+`--show-log`。默认情况下，`compile` 和 `pdf` 会使用项目在 Overleaf
+中保存的主文档。使用 `--root TEX_PATH` 可以仅为本次命令改用另一个项目
+文档，不会修改 Overleaf 中保存的主文档设置。
 
 使用熟悉的工具修改文件，创建一个本地 checkpoint，然后同步：
 

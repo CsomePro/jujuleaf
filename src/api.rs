@@ -8,6 +8,12 @@ use serde_json::{Value, json};
 
 use crate::auth::{Session, SessionStore, merge_supported_cookie};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompileRoot {
+    pub document_id: String,
+    pub resource_path: String,
+}
+
 pub struct OverleafApi {
     client: reqwest::Client,
     compile_client: reqwest::Client,
@@ -231,12 +237,23 @@ impl OverleafApi {
     }
 
     pub async fn compile(&mut self, project_id: &str, draft: bool) -> Result<Value> {
-        self.compile_detailed(project_id, draft).await
+        self.compile_detailed_with_root(project_id, draft, None)
+            .await
     }
 
     pub async fn compile_detailed(&mut self, project_id: &str, draft: bool) -> Result<Value> {
+        self.compile_detailed_with_root(project_id, draft, None)
+            .await
+    }
+
+    pub async fn compile_detailed_with_root(
+        &mut self,
+        project_id: &str,
+        draft: bool,
+        root: Option<&CompileRoot>,
+    ) -> Result<Value> {
         let path = format!("/project/{project_id}/compile?file_line_errors=true");
-        let body = json!({"check": "silent", "draft": draft});
+        let body = compile_request_body(draft, root);
         if !self.uses_cstcloud_compile_compatibility() {
             return self.post_json(&path, body, "compile project").await;
         }
@@ -325,7 +342,17 @@ impl OverleafApi {
     }
 
     pub async fn download_pdf(&mut self, project_id: &str) -> Result<Vec<u8>> {
-        let result = self.compile(project_id, false).await?;
+        self.download_pdf_with_root(project_id, None).await
+    }
+
+    pub async fn download_pdf_with_root(
+        &mut self,
+        project_id: &str,
+        root: Option<&CompileRoot>,
+    ) -> Result<Vec<u8>> {
+        let result = self
+            .compile_detailed_with_root(project_id, false, root)
+            .await?;
         let status = result
             .get("status")
             .and_then(Value::as_str)
@@ -678,6 +705,15 @@ impl OverleafApi {
     }
 }
 
+fn compile_request_body(draft: bool, root: Option<&CompileRoot>) -> Value {
+    let mut body = json!({"check": "silent", "draft": draft});
+    if let Some(root) = root {
+        body["rootDoc_id"] = json!(root.document_id);
+        body["rootResourcePath"] = json!(root.resource_path);
+    }
+    body
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +793,31 @@ mod tests {
             !OverleafApi::new(&self_hosted, None)
                 .unwrap()
                 .uses_cstcloud_compile_compatibility()
+        );
+    }
+
+    #[test]
+    fn compile_body_omits_root_override_by_default() {
+        assert_eq!(
+            compile_request_body(false, None),
+            json!({"check": "silent", "draft": false})
+        );
+    }
+
+    #[test]
+    fn compile_body_includes_explicit_root_override() {
+        let root = CompileRoot {
+            document_id: "document-id".into(),
+            resource_path: "chapters/appendix.tex".into(),
+        };
+        assert_eq!(
+            compile_request_body(true, Some(&root)),
+            json!({
+                "check": "silent",
+                "draft": true,
+                "rootDoc_id": "document-id",
+                "rootResourcePath": "chapters/appendix.tex"
+            })
         );
     }
 
