@@ -2230,7 +2230,9 @@ async fn dispatch_authenticated(
                 }
             };
             let log = if has_output(&result, "output.log") {
-                let bytes = api.download_compile_output(&result, "output.log").await?;
+                let bytes = api
+                    .download_compile_output(&project_id, &result, "output.log")
+                    .await?;
                 Some(String::from_utf8_lossy(&bytes).into_owned())
             } else {
                 None

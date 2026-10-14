@@ -73,6 +73,16 @@ impl OverleafApi {
         }
     }
 
+    fn is_same_origin(&self, url: &str) -> bool {
+        let Ok(base) = reqwest::Url::parse(&self.base_url) else {
+            return false;
+        };
+        let Ok(url) = reqwest::Url::parse(url) else {
+            return true;
+        };
+        base.origin() == url.origin()
+    }
+
     fn headers(&self, mutation: bool) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -259,21 +269,58 @@ impl OverleafApi {
         .await
     }
 
-    pub async fn download_compile_output(
-        &mut self,
-        compile_result: &Value,
-        path: &str,
-    ) -> Result<Vec<u8>> {
-        let url = compile_result
+    fn compile_output_url(project_id: &str, compile_result: &Value, path: &str) -> Result<String> {
+        let file = compile_result
             .get("outputFiles")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .find(|file| file.get("path").and_then(Value::as_str) == Some(path))
-            .and_then(|file| file.get("url"))
+            .ok_or_else(|| anyhow!("no {path} in compile output"))?;
+        let url = if compile_result
+            .get("pdfDownloadDomain")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("no {path} in compile output"))?
-            .to_owned();
+            .is_some()
+        {
+            let build = file
+                .get("build")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("no build ID for {path} in compile output"))?;
+            let mut query = Vec::new();
+            if let Some(value) = compile_result.get("clsiServerId").and_then(Value::as_str) {
+                query.push(format!("clsiserverid={}", urlencoding::encode(value)));
+            }
+            if let Some(value) = compile_result.get("compileGroup").and_then(Value::as_str) {
+                query.push(format!("compileGroup={}", urlencoding::encode(value)));
+            }
+            let query = if query.is_empty() {
+                String::new()
+            } else {
+                format!("?{}", query.join("&"))
+            };
+            format!(
+                "/project/{}/build/{}/output/{}{}",
+                urlencoding::encode(project_id),
+                urlencoding::encode(build),
+                urlencoding::encode(path),
+                query
+            )
+        } else {
+            file.get("url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("no URL for {path} in compile output"))?
+                .to_owned()
+        };
+        Ok(url)
+    }
+
+    pub async fn download_compile_output(
+        &mut self,
+        project_id: &str,
+        compile_result: &Value,
+        path: &str,
+    ) -> Result<Vec<u8>> {
+        let url = Self::compile_output_url(project_id, compile_result, path)?;
         self.download_url(&url, &format!("download {path}")).await
     }
 
@@ -286,7 +333,8 @@ impl OverleafApi {
         if status != "success" {
             bail!("compilation failed: {status}");
         }
-        self.download_compile_output(&result, "output.pdf").await
+        self.download_compile_output(project_id, &result, "output.pdf")
+            .await
     }
 
     pub async fn download_zip(&mut self, project_id: &str) -> Result<Vec<u8>> {
@@ -306,7 +354,13 @@ impl OverleafApi {
     }
 
     pub async fn download_url(&mut self, url: &str, action: &str) -> Result<Vec<u8>> {
-        let response = self.request(Method::GET, url, None).await?;
+        let response = if self.is_same_origin(url) {
+            self.request(Method::GET, url, None).await?
+        } else {
+            // Compile CDNs use capability URLs. Never forward an Overleaf
+            // session cookie (or adopt their cookies) across origins.
+            self.client.get(url).send().await?
+        };
         let status = response.status();
         if !status.is_success() {
             bail!("{action} failed ({status})");
@@ -637,6 +691,43 @@ mod tests {
         assert_eq!(
             api.url("https://cdn.example.test/output.pdf"),
             "https://cdn.example.test/output.pdf"
+        );
+        assert!(api.is_same_origin("/project"));
+        assert!(api.is_same_origin("https://example.test/output.pdf"));
+        assert!(!api.is_same_origin("https://cdn.example.test/output.pdf"));
+    }
+
+    #[test]
+    fn official_compile_outputs_use_the_authenticated_same_origin_route() {
+        let result = json!({
+            "pdfDownloadDomain": "https://compiles.overleafusercontent.com/zone/b",
+            "clsiServerId": "clsi-reg-regional-free-c3d-0cfh",
+            "compileGroup": "standard",
+            "outputFiles": [{
+                "path": "output.log",
+                "build": "1a139bc384b-efbc02936172e60b",
+                "url": "/project/project-id/user/user-id/build/build-id/output/output.log"
+            }]
+        });
+
+        assert_eq!(
+            OverleafApi::compile_output_url("project-id", &result, "output.log").unwrap(),
+            "/project/project-id/build/1a139bc384b-efbc02936172e60b/output/output.log?clsiserverid=clsi-reg-regional-free-c3d-0cfh&compileGroup=standard"
+        );
+    }
+
+    #[test]
+    fn self_hosted_compile_outputs_keep_the_server_provided_url() {
+        let result = json!({
+            "outputFiles": [{
+                "path": "output.pdf",
+                "url": "/project/project-id/output/output.pdf"
+            }]
+        });
+
+        assert_eq!(
+            OverleafApi::compile_output_url("project-id", &result, "output.pdf").unwrap(),
+            "/project/project-id/output/output.pdf"
         );
     }
 

@@ -84,6 +84,21 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+fn join_doc_args(doc_id: &str, from_version: Option<i64>, age_ms: Option<u64>) -> Vec<Value> {
+    let mut options = json!({
+        "encodeRanges": true,
+        "supportsHistoryOT": true,
+    });
+    if let Some(age_ms) = age_ms {
+        options["age"] = json!(age_ms);
+    }
+
+    match from_version {
+        Some(version) => vec![json!(doc_id), json!(version), options],
+        None => vec![json!(doc_id), options],
+    }
+}
+
 fn parse_packet(raw: &str) -> Result<Packet> {
     let Some(kind) = raw.as_bytes().first().copied() else {
         return Ok(Packet::Other);
@@ -294,15 +309,7 @@ impl OverleafSocket {
         if let Some(version) = from_version {
             ensure!(version >= 0, "fromVersion must be non-negative");
         }
-        let options = json!({
-            "encodeRanges": true,
-            "supportsHistoryOT": true,
-            "age": age_ms
-        });
-        let args = match from_version {
-            Some(version) => vec![json!(doc_id), json!(version), options],
-            None => vec![json!(doc_id), options],
-        };
+        let args = join_doc_args(doc_id, from_version, age_ms);
         let id = self.emit("joinDoc", args).await?;
         let args = self.wait_for_ack(id, Duration::from_secs(30)).await?;
         if args.first().is_some_and(|value| !value.is_null()) {
@@ -530,5 +537,26 @@ mod tests {
         let seed = generate_tc_seed();
         assert_eq!(seed.len(), 18);
         assert!(seed.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn full_join_omits_absent_optional_age() {
+        let args = join_doc_args("doc-id", None, None);
+
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], json!("doc-id"));
+        assert_eq!(args[1]["encodeRanges"], json!(true));
+        assert_eq!(args[1]["supportsHistoryOT"], json!(true));
+        assert!(args[1].get("age").is_none());
+    }
+
+    #[test]
+    fn incremental_join_sends_numeric_version_and_age() {
+        let args = join_doc_args("doc-id", Some(7), Some(1_250));
+
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], json!("doc-id"));
+        assert_eq!(args[1], json!(7));
+        assert_eq!(args[2]["age"], json!(1_250));
     }
 }
