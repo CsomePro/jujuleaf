@@ -167,6 +167,7 @@ fn option_takes_separate_value(argument: &str) -> bool {
             | "--name"
             | "--output"
             | "--log-output"
+            | "--root"
             | "--at-text"
             | "--min-count"
             | "-o"
@@ -2971,6 +2972,41 @@ mod tests {
                 show_log: true,
                 ..
             } if project_id == "project-one"
+        ));
+
+        let (cli, profile) =
+            parse_in_project(&["jujuleaf", "compile", "--root", "main-cn.tex"], &nested);
+        assert_eq!(profile.as_deref(), Some("work"));
+        assert!(matches!(
+            cli.command,
+            Command::Compile {
+                ref project_id,
+                root: Some(ref root),
+                ..
+            } if project_id == "project-one" && root == "main-cn.tex"
+        ));
+
+        let (cli, profile) = parse_in_project(
+            &[
+                "jujuleaf",
+                "pdf",
+                "--root",
+                "main-cn.tex",
+                "--output",
+                "paper.pdf",
+            ],
+            &nested,
+        );
+        assert_eq!(profile.as_deref(), Some("work"));
+        assert!(matches!(
+            cli.command,
+            Command::Pdf {
+                ref project_id,
+                root: Some(ref root),
+                ref output,
+            } if project_id == "project-one"
+                && root == "main-cn.tex"
+                && output == Path::new("paper.pdf")
         ));
 
         let (cli, _) = parse_in_project(&["jujuleaf", "search", "two", "words"], &nested);
