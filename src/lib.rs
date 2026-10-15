@@ -13,6 +13,7 @@ pub mod output;
 pub(crate) mod platform;
 pub mod project;
 pub mod review;
+pub(crate) mod review_planner;
 pub mod skill;
 pub mod socket;
 pub mod store;

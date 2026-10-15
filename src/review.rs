@@ -12,8 +12,9 @@ use crate::file_util::atomic_write;
 use crate::jj::JjWorkspace;
 use crate::operations::{
     BuildOptions, DocumentState, HISTORY_OT, LEGACY_REVIEW_DIFF_ALGORITHM, REVIEW_DIFF_ALGORITHM,
-    ReviewGranularity, build_document_operations, parse_document_snapshot,
-    review_text_changes_for_algorithm, slice_utf16, supported_review_diff_algorithm,
+    ReviewAnchor, ReviewGranularity, build_document_operations, parse_document_snapshot,
+    review_comment_anchors, review_text_changes_for_algorithm_with_anchors, slice_utf16,
+    supported_review_diff_algorithm,
 };
 use crate::platform::workspace_path;
 use crate::project::{DocumentRef, collect_entities, connect_project_with_api};
@@ -219,6 +220,7 @@ struct RemoteReviewDocument {
     content: String,
     hash: String,
     metadata_hash: String,
+    comment_anchors: Vec<ReviewAnchor>,
     ranges_json: String,
     snapshot_metadata_json: String,
     tracked_change_ids: BTreeSet<String>,
@@ -511,6 +513,7 @@ async fn read_remote_document(
     let state = parse_document_snapshot(joined.snapshot, &joined.ot_type)?;
     let (snapshot, metadata_hash) = metadata_parts(&state, &joined.ranges)?;
     let tracked_change_ids = tracked_change_ids(&state, &joined.ranges);
+    let comment_anchors = review_comment_anchors(&state, &joined.ranges);
     let result = RemoteReviewDocument {
         id: document.id.clone(),
         path: document.path.clone(),
@@ -518,6 +521,7 @@ async fn read_remote_document(
         hash: content_hash(&state.content),
         content: state.content,
         metadata_hash,
+        comment_anchors,
         ranges_json: serde_json::to_string(&joined.ranges)?,
         snapshot_metadata_json: serde_json::to_string(&snapshot)?,
         tracked_change_ids,
@@ -749,11 +753,12 @@ pub async fn review_diff_with_api(
             baseline.path
         );
         let local = read_document(root, &baseline.path)?;
-        let planned = review_text_changes_for_algorithm(
+        let planned = review_text_changes_for_algorithm_with_anchors(
             &remote.content,
             &local,
             state.granularity,
             &state.diff_algorithm,
+            &remote.comment_anchors,
         )?;
         if planned.is_empty() {
             continue;
@@ -1026,11 +1031,13 @@ pub async fn submit_review_with_api(
             "local file changed after review submission started: {}",
             baseline.path
         );
-        let planned = review_text_changes_for_algorithm(
+        let comment_anchors = review_comment_anchors(&document_state, &joined.ranges);
+        let planned = review_text_changes_for_algorithm_with_anchors(
             &document_state.content,
             &local,
             state.granularity,
             &state.diff_algorithm,
+            &comment_anchors,
         )?;
         if planned.is_empty() {
             unchanged.push(baseline.path);
@@ -1458,6 +1465,7 @@ pub async fn finish_review_with_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operations::{PREVIOUS_REVIEW_DIFF_ALGORITHM, STRUCTURAL_REVIEW_DIFF_ALGORITHM};
     use crate::store::content_hash;
 
     #[test]
@@ -1529,23 +1537,44 @@ mod tests {
     }
 
     #[test]
-    fn in_flight_legacy_review_algorithm_remains_supported() {
-        let mut legacy = test_state(ReviewPhase::Submitting);
-        legacy.diff_algorithm = LEGACY_REVIEW_DIFF_ALGORITHM.into();
-        assert!(require_supported_diff_algorithm(&legacy).is_ok());
+    fn in_flight_older_review_algorithms_remain_supported() {
+        let mut state = test_state(ReviewPhase::Submitting);
+        for algorithm in [
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+            PREVIOUS_REVIEW_DIFF_ALGORITHM,
+            STRUCTURAL_REVIEW_DIFF_ALGORITHM,
+            REVIEW_DIFF_ALGORITHM,
+        ] {
+            state.diff_algorithm = algorithm.into();
+            assert!(require_supported_diff_algorithm(&state).is_ok());
+        }
 
         let current_hash =
             review_plan_hash(REVIEW_DIFF_ALGORITHM, ReviewGranularity::Adaptive, &[]).unwrap();
+        let structural_hash = review_plan_hash(
+            STRUCTURAL_REVIEW_DIFF_ALGORITHM,
+            ReviewGranularity::Adaptive,
+            &[],
+        )
+        .unwrap();
+        let previous_hash = review_plan_hash(
+            PREVIOUS_REVIEW_DIFF_ALGORITHM,
+            ReviewGranularity::Adaptive,
+            &[],
+        )
+        .unwrap();
         let legacy_hash = review_plan_hash(
             LEGACY_REVIEW_DIFF_ALGORITHM,
             ReviewGranularity::Adaptive,
             &[],
         )
         .unwrap();
-        assert_ne!(current_hash, legacy_hash);
+        assert_ne!(current_hash, structural_hash);
+        assert_ne!(structural_hash, previous_hash);
+        assert_ne!(previous_hash, legacy_hash);
 
-        legacy.diff_algorithm = "semantic-v999".into();
-        assert!(require_supported_diff_algorithm(&legacy).is_err());
+        state.diff_algorithm = "semantic-v999".into();
+        assert!(require_supported_diff_algorithm(&state).is_err());
     }
 
     #[test]

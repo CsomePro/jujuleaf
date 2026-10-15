@@ -1,17 +1,20 @@
 use std::collections::BTreeMap;
+use std::ops::Range;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use similar::{ChangeTag, TextDiff};
+use similar::{Algorithm, ChangeTag, DiffTag, TextDiff, capture_diff_slices};
 
-use crate::latex_blocks::{LatexBlock, scan_latex_blocks};
+use crate::latex_blocks::{LatexBlock, LatexBlockKind, scan_latex_blocks};
 
 pub const LEGACY_OT: &str = "sharejs-text-ot";
 pub const HISTORY_OT: &str = "history-ot";
 pub const LEGACY_REVIEW_DIFF_ALGORITHM: &str = "semantic-v1";
-pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v2";
+pub const PREVIOUS_REVIEW_DIFF_ALGORITHM: &str = "semantic-v2";
+pub const STRUCTURAL_REVIEW_DIFF_ALGORITHM: &str = "semantic-v3";
+pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v4";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -68,6 +71,12 @@ pub struct PlannedTextChange {
     pub atomic_change_count: usize,
     pub removed: usize,
     pub inserted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReviewAnchor {
+    pub from: usize,
+    pub to: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -519,7 +528,7 @@ fn structured_replacement(
     }
 }
 
-fn structural_review_changes(
+fn structural_review_changes_v2(
     before: &str,
     after: &str,
     atomic_change_count: usize,
@@ -612,6 +621,316 @@ fn structural_review_changes(
     Some(planned)
 }
 
+const MAX_STRUCTURAL_BLOCKS: usize = 64;
+const MAX_COARSE_STRUCTURAL_GROUPS: usize = 128;
+const COARSE_BLOCK_TARGET: usize = 48;
+
+fn block_range_text<'a>(
+    text: &'a str,
+    blocks: &[LatexBlock],
+    range: &Range<usize>,
+) -> (usize, &'a str) {
+    let start = if range.start < blocks.len() {
+        blocks[range.start].byte_from
+    } else {
+        text.len()
+    };
+    let end = if range.is_empty() {
+        start
+    } else {
+        blocks[range.end - 1].byte_to
+    };
+    (start, &text[start..end])
+}
+
+fn fallback_review_text_range(
+    before: &str,
+    old_start_byte: usize,
+    old: &str,
+    new: &str,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    let base = utf16_len(&before[..old_start_byte]);
+    let atoms = minimal_text_changes(old, new)
+        .into_iter()
+        .map(|mut change| {
+            change.from += base;
+            change.to = change.to.map(|to| to + base);
+            planned_atom(change)
+        })
+        .collect::<Vec<_>>();
+    group_review_atoms(before, &atoms, granularity)
+}
+
+fn planned_range_replacement(
+    before: &str,
+    old_start_byte: usize,
+    old: &str,
+    new: &str,
+) -> PlannedTextChange {
+    let from = utf16_len(&before[..old_start_byte]);
+    PlannedTextChange {
+        change: InputChange {
+            from,
+            to: Some(from + utf16_len(old)),
+            insert: Some(new.to_owned()),
+            expect: Some(old.to_owned()),
+        },
+        atomic_change_count: minimal_text_changes(old, new).len().max(1),
+        removed: utf16_len(old),
+        inserted: utf16_len(new),
+    }
+}
+
+fn chunks_contain_unknown(chunks: &[LatexBlock]) -> bool {
+    chunks.iter().any(|block| block.kind.is_unknown())
+}
+
+fn append_aligned_replacement(
+    before: &str,
+    after: &str,
+    old_chunks: &[LatexBlock],
+    new_chunks: &[LatexBlock],
+    granularity: ReviewGranularity,
+    planned: &mut Vec<PlannedTextChange>,
+) -> Result<()> {
+    let old = chunk_group_text(before, old_chunks);
+    let new = chunk_group_text(after, new_chunks);
+    if old == new {
+        return Ok(());
+    }
+    if chunks_contain_unknown(old_chunks) || chunks_contain_unknown(new_chunks) {
+        planned.extend(fallback_review_text_range(
+            before,
+            old_chunks[0].byte_from,
+            old,
+            new,
+            granularity,
+        )?);
+    } else {
+        planned.push(structured_replacement(
+            before, after, old_chunks, new_chunks,
+        ));
+    }
+    Ok(())
+}
+
+fn align_structural_blocks(
+    before: &str,
+    after: &str,
+    old_blocks: &[LatexBlock],
+    new_blocks: &[LatexBlock],
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    debug_assert!(!old_blocks.is_empty());
+    debug_assert!(!new_blocks.is_empty());
+
+    let mut planned = Vec::new();
+    if old_blocks.len() >= new_blocks.len() {
+        let boundaries = best_review_partition(before, old_blocks, after, new_blocks);
+        for (index, new_block) in new_blocks.iter().enumerate() {
+            append_aligned_replacement(
+                before,
+                after,
+                &old_blocks[boundaries[index]..boundaries[index + 1]],
+                std::slice::from_ref(new_block),
+                granularity,
+                &mut planned,
+            )?;
+        }
+    } else {
+        let boundaries = best_review_partition(after, new_blocks, before, old_blocks);
+        for (index, old_block) in old_blocks.iter().enumerate() {
+            append_aligned_replacement(
+                before,
+                after,
+                std::slice::from_ref(old_block),
+                &new_blocks[boundaries[index]..boundaries[index + 1]],
+                granularity,
+                &mut planned,
+            )?;
+        }
+    }
+    Ok(planned)
+}
+
+fn is_major_structural_command(text: &str, block: &LatexBlock) -> bool {
+    if block.kind != LatexBlockKind::Command {
+        return false;
+    }
+    let command = chunk_group_text(text, std::slice::from_ref(block))
+        .trim_start()
+        .strip_prefix('\\')
+        .unwrap_or_default();
+    let name = command
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic() || *character == '@')
+        .collect::<String>();
+    matches!(
+        name.as_str(),
+        "part"
+            | "chapter"
+            | "section"
+            | "subsection"
+            | "subsubsection"
+            | "paragraph"
+            | "subparagraph"
+            | "appendix"
+            | "appendices"
+    )
+}
+
+fn is_coarse_atomic_block(block: &LatexBlock) -> bool {
+    matches!(
+        block.kind,
+        LatexBlockKind::FigurePart
+            | LatexBlockKind::Table
+            | LatexBlockKind::Math
+            | LatexBlockKind::Code
+            | LatexBlockKind::Drawing
+            | LatexBlockKind::Opaque
+            | LatexBlockKind::Unknown
+    )
+}
+
+fn coarse_block(blocks: &[LatexBlock]) -> LatexBlock {
+    debug_assert!(!blocks.is_empty());
+    let kind = if blocks.len() == 1 {
+        blocks[0].kind
+    } else if chunks_contain_unknown(blocks) {
+        LatexBlockKind::Unknown
+    } else {
+        blocks
+            .iter()
+            .find(|block| block.kind.is_structured())
+            .map_or(LatexBlockKind::Prose, |block| block.kind)
+    };
+    LatexBlock {
+        byte_from: blocks[0].byte_from,
+        byte_to: blocks[blocks.len() - 1].byte_to,
+        kind,
+    }
+}
+
+fn coarse_review_blocks(text: &str, blocks: &[LatexBlock]) -> Vec<LatexBlock> {
+    if blocks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut grouped = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < blocks.len() {
+        let atomic = is_coarse_atomic_block(&blocks[index]);
+        let boundary = is_major_structural_command(text, &blocks[index]);
+        if index > start && (atomic || boundary || index - start >= COARSE_BLOCK_TARGET) {
+            grouped.push(coarse_block(&blocks[start..index]));
+            start = index;
+        }
+        if atomic {
+            grouped.push(blocks[index]);
+            start = index + 1;
+        }
+        index += 1;
+    }
+    if start < blocks.len() {
+        grouped.push(coarse_block(&blocks[start..]));
+    }
+    grouped
+}
+
+fn plan_changed_block_region(
+    before: &str,
+    after: &str,
+    old_blocks: &[LatexBlock],
+    new_blocks: &[LatexBlock],
+    old_range: Range<usize>,
+    new_range: Range<usize>,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    let (old_start, old) = block_range_text(before, old_blocks, &old_range);
+    let (_, new) = block_range_text(after, new_blocks, &new_range);
+    if old == new {
+        return Ok(Vec::new());
+    }
+
+    let old_slice = &old_blocks[old_range];
+    let new_slice = &new_blocks[new_range];
+    if old_slice.is_empty() || new_slice.is_empty() {
+        return Ok(vec![planned_range_replacement(before, old_start, old, new)]);
+    }
+
+    if old_slice.len() <= MAX_STRUCTURAL_BLOCKS && new_slice.len() <= MAX_STRUCTURAL_BLOCKS {
+        if chunks_contain_unknown(old_slice) || chunks_contain_unknown(new_slice) {
+            return fallback_review_text_range(before, old_start, old, new, granularity);
+        }
+        return align_structural_blocks(before, after, old_slice, new_slice, granularity);
+    }
+
+    let coarse_old = coarse_review_blocks(before, old_slice);
+    let coarse_new = coarse_review_blocks(after, new_slice);
+    if !coarse_old.is_empty()
+        && !coarse_new.is_empty()
+        && coarse_old.len() <= MAX_COARSE_STRUCTURAL_GROUPS
+        && coarse_new.len() <= MAX_COARSE_STRUCTURAL_GROUPS
+        && (coarse_old.len() < old_slice.len() || coarse_new.len() < new_slice.len())
+    {
+        return align_structural_blocks(before, after, &coarse_old, &coarse_new, granularity);
+    }
+
+    Ok(vec![planned_range_replacement(before, old_start, old, new)])
+}
+
+/// Plan large LaTeX rewrites as independent block-diff windows. Exact unchanged
+/// blocks become anchors, so a large chapter no longer poisons the entire
+/// document when one window exceeds the detailed DP limit or contains an
+/// unknown construct.
+fn structural_review_changes(
+    before: &str,
+    after: &str,
+    atomic_change_count: usize,
+    granularity: ReviewGranularity,
+) -> Result<Option<Vec<PlannedTextChange>>> {
+    const MIN_STRUCTURAL_ATOMS: usize = 8;
+
+    if atomic_change_count < MIN_STRUCTURAL_ATOMS {
+        return Ok(None);
+    }
+
+    let old_scan = scan_latex_blocks(before);
+    let new_scan = scan_latex_blocks(after);
+    if !old_scan.valid || !new_scan.valid {
+        return Ok(None);
+    }
+
+    let old_text = old_scan
+        .blocks
+        .iter()
+        .map(|block| chunk_group_text(before, std::slice::from_ref(block)))
+        .collect::<Vec<_>>();
+    let new_text = new_scan
+        .blocks
+        .iter()
+        .map(|block| chunk_group_text(after, std::slice::from_ref(block)))
+        .collect::<Vec<_>>();
+    let mut planned = Vec::new();
+    for operation in capture_diff_slices(Algorithm::Patience, &old_text, &new_text) {
+        if operation.tag() == DiffTag::Equal {
+            continue;
+        }
+        planned.extend(plan_changed_block_region(
+            before,
+            after,
+            &old_scan.blocks,
+            &new_scan.blocks,
+            operation.old_range(),
+            operation.new_range(),
+            granularity,
+        )?);
+    }
+    Ok(Some(planned))
+}
+
 fn group_review_atoms(
     before: &str,
     atoms: &[PlannedTextChange],
@@ -655,7 +974,7 @@ fn group_review_atoms(
 /// multiple nearby atoms may be combined. Large changes are scanned into
 /// LaTeX-aware prose, list, figure, table, math, code, and drawing blocks before
 /// alignment, while small edits retain exact character ranges.
-pub fn review_text_changes(
+fn review_text_changes_v2(
     before: &str,
     after: &str,
     granularity: ReviewGranularity,
@@ -667,11 +986,95 @@ pub fn review_text_changes(
     if matches!(
         granularity,
         ReviewGranularity::Adaptive | ReviewGranularity::Sentence
-    ) && let Some(planned) = structural_review_changes(before, after, atoms.len())
+    ) && let Some(planned) = structural_review_changes_v2(before, after, atoms.len())
     {
         return Ok(planned);
     }
     group_review_atoms(before, &atoms, granularity)
+}
+
+/// Plan human-reviewable changes while preserving the exact transport diff for
+/// ordinary synchronization. A single contiguous edit is never widened. Large
+/// changes use exact unchanged blocks as independent anchors, with detailed or
+/// coarse LaTeX-aware alignment inside each changed window. Unknown constructs
+/// fall back only within their local window, while small edits retain exact
+/// character ranges.
+fn review_text_changes_v3(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    let atoms: Vec<_> = minimal_text_changes(before, after)
+        .into_iter()
+        .map(planned_atom)
+        .collect();
+    if matches!(
+        granularity,
+        ReviewGranularity::Adaptive | ReviewGranularity::Sentence
+    ) && let Some(planned) = structural_review_changes(before, after, atoms.len(), granularity)?
+    {
+        return Ok(planned);
+    }
+    group_review_atoms(before, &atoms, granularity)
+}
+
+/// Plan human-reviewable changes with the semantic-v4 hierarchy. Exact
+/// grapheme changes are combined into words, sentences, and lines only when a
+/// deterministic cost model finds the broader hunk easier to review.
+pub fn review_text_changes(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+) -> Result<Vec<PlannedTextChange>> {
+    review_text_changes_with_anchors(before, after, granularity, &[])
+}
+
+pub fn review_text_changes_with_anchors(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+    anchors: &[ReviewAnchor],
+) -> Result<Vec<PlannedTextChange>> {
+    let hierarchical =
+        crate::review_planner::hierarchical_review_changes(before, after, granularity, anchors)?;
+    if granularity == ReviewGranularity::Adaptive
+        && anchors.is_empty()
+        && before.bytes().filter(|byte| *byte == b'\n').count()
+            != after.bytes().filter(|byte| *byte == b'\n').count()
+    {
+        let structural = review_text_changes_v3(before, after, granularity)?;
+        if structural_reshape_plan_is_clearer(&hierarchical, &structural) {
+            return Ok(structural);
+        }
+    }
+    Ok(hierarchical)
+}
+
+fn structural_reshape_plan_is_clearer(
+    hierarchical: &[PlannedTextChange],
+    structural: &[PlannedTextChange],
+) -> bool {
+    structural.len() > 1
+        && structural.len().saturating_mul(2) < hierarchical.len()
+        && structural.iter().all(|change| {
+            let old_lines = change
+                .change
+                .expect
+                .as_deref()
+                .unwrap_or_default()
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            let new_lines = change
+                .change
+                .insert
+                .as_deref()
+                .unwrap_or_default()
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            old_lines.min(new_lines) <= 1
+        })
 }
 
 pub fn review_text_changes_for_algorithm(
@@ -680,8 +1083,22 @@ pub fn review_text_changes_for_algorithm(
     granularity: ReviewGranularity,
     algorithm: &str,
 ) -> Result<Vec<PlannedTextChange>> {
+    review_text_changes_for_algorithm_with_anchors(before, after, granularity, algorithm, &[])
+}
+
+pub fn review_text_changes_for_algorithm_with_anchors(
+    before: &str,
+    after: &str,
+    granularity: ReviewGranularity,
+    algorithm: &str,
+    anchors: &[ReviewAnchor],
+) -> Result<Vec<PlannedTextChange>> {
     match algorithm {
-        REVIEW_DIFF_ALGORITHM => review_text_changes(before, after, granularity),
+        REVIEW_DIFF_ALGORITHM => {
+            review_text_changes_with_anchors(before, after, granularity, anchors)
+        }
+        STRUCTURAL_REVIEW_DIFF_ALGORITHM => review_text_changes_v3(before, after, granularity),
+        PREVIOUS_REVIEW_DIFF_ALGORITHM => review_text_changes_v2(before, after, granularity),
         LEGACY_REVIEW_DIFF_ALGORITHM => {
             let atoms: Vec<_> = minimal_text_changes(before, after)
                 .into_iter()
@@ -696,7 +1113,10 @@ pub fn review_text_changes_for_algorithm(
 pub fn supported_review_diff_algorithm(algorithm: &str) -> bool {
     matches!(
         algorithm,
-        REVIEW_DIFF_ALGORITHM | LEGACY_REVIEW_DIFF_ALGORITHM
+        REVIEW_DIFF_ALGORITHM
+            | STRUCTURAL_REVIEW_DIFF_ALGORITHM
+            | PREVIOUS_REVIEW_DIFF_ALGORITHM
+            | LEGACY_REVIEW_DIFF_ALGORITHM
     )
 }
 fn byte_index_at_utf16(text: &str, target: usize) -> Result<usize> {
@@ -869,6 +1289,79 @@ pub fn source_to_visible_position(position: usize, state: &DocumentState) -> Res
         source_cursor = end;
     }
     Ok(position - hidden)
+}
+
+/// Extract every Overleaf comment anchor in the visible UTF-16 coordinate
+/// space used by review planning. Resolved comments remain protected because
+/// they can be reopened later.
+pub fn review_comment_anchors(state: &DocumentState, ranges: &Value) -> Vec<ReviewAnchor> {
+    let mut anchors = Vec::new();
+    if state.ot_type == HISTORY_OT {
+        for comment in state
+            .raw
+            .get("comments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for range in comment
+                .get("ranges")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(from) = range.get("pos").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(length) = range.get("length").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let source_from = from as usize;
+                let Some(source_to) = source_from.checked_add(length as usize) else {
+                    continue;
+                };
+                let (Ok(from), Ok(to)) = (
+                    source_to_visible_position(source_from, state),
+                    source_to_visible_position(source_to, state),
+                ) else {
+                    continue;
+                };
+                anchors.push(ReviewAnchor { from, to });
+            }
+        }
+    } else {
+        for comment in ranges
+            .get("comments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let operation = comment.get("op").unwrap_or(comment);
+            let Some(from) = operation.get("p").and_then(Value::as_u64) else {
+                continue;
+            };
+            let length = operation
+                .get("c")
+                .and_then(Value::as_str)
+                .map(utf16_len)
+                .or_else(|| {
+                    operation
+                        .get("length")
+                        .and_then(Value::as_u64)
+                        .map(|length| length as usize)
+                });
+            let Some(length) = length else {
+                continue;
+            };
+            anchors.push(ReviewAnchor {
+                from: from as usize,
+                to: (from as usize).saturating_add(length),
+            });
+        }
+    }
+    anchors.sort_unstable_by_key(|anchor| (anchor.from, anchor.to));
+    anchors.dedup();
+    anchors
 }
 
 pub fn normalize_changes(inputs: &[InputChange], content: &str) -> Result<Vec<Change>> {
@@ -1401,6 +1894,8 @@ pub fn validate_history_operations(state: &DocumentState, ops: &[Value]) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write;
+
     use super::*;
     use pretty_assertions::assert_eq;
 
@@ -1419,6 +1914,42 @@ mod tests {
         let encoded: String = "中文".as_bytes().iter().copied().map(char::from).collect();
         let state = parse_document_snapshot(json!(["hello", encoded]), LEGACY_OT).unwrap();
         assert_eq!(state.content, "hello\n中文");
+    }
+
+    #[test]
+    fn review_comment_anchors_normalize_history_and_legacy_coordinates() {
+        let history = DocumentState {
+            ot_type: HISTORY_OT.to_owned(),
+            content: "abcd".to_owned(),
+            source_content: "abOLDcd".to_owned(),
+            tracked_delete_ranges: vec![DeleteRange { pos: 2, length: 3 }],
+            raw: json!({
+                "comments": [
+                    {"ranges": [{"pos": 5, "length": 2}]},
+                    {"ranges": [{"pos": "invalid", "length": 1}]}
+                ]
+            }),
+        };
+        assert_eq!(
+            review_comment_anchors(&history, &Value::Null),
+            vec![ReviewAnchor { from: 2, to: 4 }]
+        );
+
+        let legacy = legacy("alpha beta");
+        let ranges = json!({
+            "comments": [
+                {"op": {"p": 6, "c": "beta"}},
+                {"p": 0, "length": 5},
+                {"p": 0, "length": 5}
+            ]
+        });
+        assert_eq!(
+            review_comment_anchors(&legacy, &ranges),
+            vec![
+                ReviewAnchor { from: 0, to: 5 },
+                ReviewAnchor { from: 6, to: 10 }
+            ]
+        );
     }
 
     #[test]
@@ -1474,10 +2005,154 @@ mod tests {
         granularity: ReviewGranularity,
     ) -> Vec<PlannedTextChange> {
         let planned = review_text_changes(before, after, granularity).unwrap();
+        assert_review_plan_applies(before, after, &planned);
+        planned
+    }
+
+    fn apply_review_plan_for_algorithm(
+        before: &str,
+        after: &str,
+        granularity: ReviewGranularity,
+        algorithm: &str,
+    ) -> Vec<PlannedTextChange> {
+        let planned =
+            review_text_changes_for_algorithm(before, after, granularity, algorithm).unwrap();
+        assert_review_plan_applies(before, after, &planned);
+        planned
+    }
+
+    fn assert_review_plan_applies(before: &str, after: &str, planned: &[PlannedTextChange]) {
         let inputs: Vec<_> = planned.iter().map(|item| item.change.clone()).collect();
         let normalized = normalize_changes(&inputs, before).unwrap();
         assert_eq!(apply_changes(before, &normalized).unwrap(), after);
-        planned
+    }
+
+    fn synthetic_review_document(sections: usize, revised: bool) -> String {
+        let (lead, first, second, third) = if revised {
+            ("Revised", "amber", "blue", "cyan")
+        } else {
+            ("Baseline", "alpha", "beta", "gamma")
+        };
+        let mut document = String::new();
+        for section in 0..sections {
+            writeln!(document, "\\section{{Synthetic Topic {section}}}").unwrap();
+            for sentence in 0..8 {
+                writeln!(
+                    document,
+                    "{lead} observation {section}-{sentence} measures {first} after a deliberately long stable bridge, compares {second} after another deliberately long stable bridge, and finally reports {third}."
+                )
+                .unwrap();
+            }
+        }
+        document
+    }
+
+    #[test]
+    fn semantic_v3_windows_large_structured_rewrites() {
+        let before = synthetic_review_document(10, false);
+        let after = synthetic_review_document(10, true);
+        assert!(minimal_text_changes(&before, &after).len() > MAX_STRUCTURAL_BLOCKS);
+
+        let legacy = review_text_changes_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        let previous = review_text_changes_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            PREVIOUS_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        assert_eq!(previous, legacy);
+
+        let current = apply_review_plan_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            STRUCTURAL_REVIEW_DIFF_ALGORITHM,
+        );
+        assert_eq!(current.len(), 80);
+        assert!(current.len() * 3 < previous.len());
+        let atomic_changes = current
+            .iter()
+            .map(|change| change.atomic_change_count)
+            .sum::<usize>();
+        assert!(atomic_changes >= current.len());
+        assert!(atomic_changes <= minimal_text_changes(&before, &after).len());
+    }
+
+    #[test]
+    fn semantic_v3_contains_unknown_fallback_to_its_local_window() {
+        let first_before = synthetic_review_document(1, false);
+        let first_after = synthetic_review_document(1, true);
+        let second_before = first_before.replace("Synthetic Topic 0", "Synthetic Topic 1");
+        let second_after = first_after.replace("Synthetic Topic 0", "Synthetic Topic 1");
+        let before = format!(
+            "{first_before}\\begin{{customlayout}}\nOpaque baseline marker remains locally reviewable.\n\\end{{customlayout}}\n{second_before}"
+        );
+        let after = format!(
+            "{first_after}\\begin{{customlayout}}\nOpaque revised marker remains locally reviewable.\n\\end{{customlayout}}\n{second_after}"
+        );
+
+        let legacy = review_text_changes_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        let previous = review_text_changes_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            PREVIOUS_REVIEW_DIFF_ALGORITHM,
+        )
+        .unwrap();
+        assert_eq!(previous, legacy);
+
+        let current = apply_review_plan_for_algorithm(
+            &before,
+            &after,
+            ReviewGranularity::Adaptive,
+            STRUCTURAL_REVIEW_DIFF_ALGORITHM,
+        );
+        assert!(current.len() < previous.len());
+        assert!(current.iter().all(|change| {
+            !change
+                .change
+                .expect
+                .as_deref()
+                .unwrap_or_default()
+                .contains("customlayout")
+        }));
+        assert!(current.iter().any(|change| {
+            change
+                .change
+                .expect
+                .as_deref()
+                .is_some_and(|text| text.contains("baseline"))
+                && change
+                    .change
+                    .insert
+                    .as_deref()
+                    .is_some_and(|text| text.contains("revised"))
+        }));
+    }
+
+    #[test]
+    fn review_diff_algorithm_versions_remain_supported() {
+        for algorithm in [
+            LEGACY_REVIEW_DIFF_ALGORITHM,
+            PREVIOUS_REVIEW_DIFF_ALGORITHM,
+            STRUCTURAL_REVIEW_DIFF_ALGORITHM,
+            REVIEW_DIFF_ALGORITHM,
+        ] {
+            assert!(supported_review_diff_algorithm(algorithm));
+        }
     }
 
     #[test]
@@ -1519,75 +2194,55 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_review_plan_aligns_paragraph_to_itemize_rewrites() {
-        let before = "Three challenges determine whether this observation supports a recovery method. First, the information must be absent from the passive outputs against which the method is compared. We construct score vectors with identical complete finite-precision passive outputs and retain queries that distinguish them. Second, recovery must handle an unknown tie priority and bounded biases without receiving a numerical comparison result. We derive binary queries that identify the scores exactly and bound their cost. Third, removing the dependence must occur before the operation that introduces it. We compare preprocessing orders and measure their effects on both the distinguishing queries and independently generated random biases.";
-        let after = r#"We address three questions about this numerical channel:
+    fn adaptive_review_plan_uses_structural_units_when_lines_are_reshaped() {
+        let before = "Three garden signals guide the controller. First, the red sensor measures heat and the blue sensor records light. Second, the controller compares both readings before selecting a mode. Third, the final mode is checked against a fixed safety limit.";
+        let after = r#"We organize the garden controller around three checks:
 \begin{itemize}
-\item \textbf{What additional information is disclosed?} We test whether chosen biases distinguish score vectors with identical complete passive outputs.
-\item \textbf{How can absolute scores be recovered?} We seek exact recovery from token responses under bounded biases and unknown tie priority.
-\item \textbf{How does processing order affect disclosure?} We compare subtraction of the maximum before and after bias addition, examining disclosure and preservation of token decisions under random biases.
+\item \textbf{What is measured?} The red sensor measures heat and the blue sensor records light.
+\item \textbf{How is a mode selected?} The controller compares both readings before selecting a mode.
+\item \textbf{What makes the mode safe?} The final mode is checked against a fixed safety limit.
 \end{itemize}"#;
 
         let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
-        assert_eq!(planned.len(), 4);
+        assert!(planned.len() >= 3);
+        assert!(planned.len() <= 5);
         assert!(
             planned[0]
                 .change
                 .expect
                 .as_deref()
-                .is_some_and(|text| text.starts_with("Three challenges"))
+                .is_some_and(|text| text.starts_with("Three garden signals"))
         );
         assert!(
             planned[0]
                 .change
                 .insert
                 .as_deref()
-                .is_some_and(|text| text.starts_with("We address"))
+                .is_some_and(|text| text.starts_with("We organize"))
         );
-        assert!(
-            planned[1]
-                .change
-                .expect
-                .as_deref()
-                .is_some_and(|text| text.contains("First,") && text.contains("We construct"))
-        );
-        assert!(
-            planned[1]
+        assert!(planned.iter().any(|change| {
+            change
                 .change
                 .insert
                 .as_deref()
-                .is_some_and(|text| text.contains(r"\begin{itemize}") && text.contains(r"\item"))
-        );
-        assert!(
-            planned[2]
-                .change
-                .expect
-                .as_deref()
-                .is_some_and(|text| text.contains("Second,") && text.contains("We derive"))
-        );
-        assert!(
-            planned[3]
-                .change
-                .expect
-                .as_deref()
-                .is_some_and(|text| text.contains("Third,") && text.contains("We compare"))
-        );
-        assert!(
-            planned[3]
+                .is_some_and(|text| text.contains(r"\begin{itemize}"))
+        }));
+        assert!(planned.iter().any(|change| {
+            change
                 .change
                 .insert
                 .as_deref()
-                .is_some_and(|text| text.ends_with(r"\end{itemize}"))
-        );
+                .is_some_and(|text| text.contains(r"\end{itemize}"))
+        }));
 
-        let legacy = review_text_changes_for_algorithm(
+        let exact = review_text_changes_for_algorithm(
             before,
             after,
             ReviewGranularity::Adaptive,
             LEGACY_REVIEW_DIFF_ALGORITHM,
         )
         .unwrap();
-        assert!(legacy.len() > planned.len());
+        assert!(exact.len() > planned.len());
     }
 
     #[test]
@@ -1610,26 +2265,20 @@ mod tests {
 "#;
         assert!(minimal_text_changes(before, after).len() >= 8);
         let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
-        assert_eq!(planned.len(), 3);
-        assert!(
-            planned[0]
-                .change
-                .expect
-                .as_deref()
-                .is_some_and(|text| text.contains("baseline-left.pdf"))
-        );
-        assert!(planned[1].change.expect.as_deref().is_some_and(|text| {
-            text.starts_with(r"\includegraphics") && text.contains("baseline-right.pdf")
+        assert!(planned.len() >= 3);
+        assert!(planned.iter().all(|change| {
+            let removed = change.change.expect.as_deref().unwrap_or_default();
+            !removed.contains('\n')
+                && !removed.contains(r"\begin{figure}")
+                && !removed.contains(r"\end{figure}")
+                && !removed.contains(r"\includegraphics")
+                && !removed.contains(r"\caption")
+                && !removed.contains(r"\label")
         }));
-        assert!(planned[2].change.expect.as_deref().is_some_and(
-            |text| text.starts_with(r"\caption")
-                && text.contains(r"\label{fig:comparison}")
-                && text.ends_with("\\end{figure}\n")
-        ));
     }
 
     #[test]
-    fn adaptive_review_plan_treats_protected_environments_as_atomic() {
+    fn adaptive_review_plan_keeps_protected_environment_edits_line_local() {
         let cases = [
             (
                 r#"\begin{table}
@@ -1708,9 +2357,15 @@ const denim = quaternary();
         for (before, after) in cases {
             assert!(minimal_text_changes(before, after).len() >= 8);
             let planned = apply_review_plan(before, after, ReviewGranularity::Adaptive);
-            assert_eq!(planned.len(), 1);
-            assert_eq!(planned[0].change.expect.as_deref(), Some(before));
-            assert_eq!(planned[0].change.insert.as_deref(), Some(after));
+            assert!(planned.len() > 1);
+            assert!(planned.iter().all(|change| {
+                !change
+                    .change
+                    .expect
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains('\n')
+            }));
         }
     }
 

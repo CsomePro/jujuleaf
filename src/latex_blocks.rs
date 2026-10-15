@@ -770,6 +770,8 @@ fn is_safe_standalone_command(name: &str) -> bool {
             | "paragraph"
             | "subparagraph"
             | "documentclass"
+            | "appendix"
+            | "appendices"
             | "usepackage"
             | "RequirePackage"
             | "title"
@@ -818,6 +820,8 @@ fn is_structural_command(name: &str) -> bool {
         normalized_command_name(name),
         "part"
             | "chapter"
+            | "appendix"
+            | "appendices"
             | "section"
             | "subsection"
             | "subsubsection"
@@ -1088,6 +1092,22 @@ After.
                 .blocks
                 .iter()
                 .any(|block| block.kind == LatexBlockKind::Unknown)
+        );
+    }
+
+    #[test]
+    fn appendix_commands_are_structural() {
+        let source = "\\appendix\n\\section{Supplement}\n\\appendices\n";
+        let scan = scan_latex_blocks(source);
+        assert!(scan.valid);
+        assert!(
+            scan.blocks
+                .iter()
+                .all(|block| block.kind != LatexBlockKind::Unknown)
+        );
+        assert_eq!(
+            scan.signature,
+            vec!["command:appendix", "command:section", "command:appendices"]
         );
     }
 
