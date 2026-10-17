@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::hash::Hash;
 use std::ops::Range;
 
 use anyhow::{Result, anyhow, bail, ensure};
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use similar::{Algorithm, ChangeTag, DiffTag, TextDiff, capture_diff_slices};
+use similar::algorithms::{Capture, Replace, diff_slices};
+use similar::{Algorithm, ChangeTag, DiffOp, DiffTag, TextDiff, capture_diff_slices};
 
 use crate::latex_blocks::{LatexBlock, LatexBlockKind, scan_latex_blocks};
 
@@ -15,6 +17,52 @@ pub const LEGACY_REVIEW_DIFF_ALGORITHM: &str = "semantic-v1";
 pub const PREVIOUS_REVIEW_DIFF_ALGORITHM: &str = "semantic-v2";
 pub const STRUCTURAL_REVIEW_DIFF_ALGORITHM: &str = "semantic-v3";
 pub const REVIEW_DIFF_ALGORITHM: &str = "semantic-v4";
+
+/// Capture the human-oriented compact diff when its old/new ranges still form
+/// complete, non-overlapping partitions. Compact may shift repeated tokens
+/// across delete/insert boundaries and produce crossing ranges; fall back to
+/// the unshifted diff in that case.
+pub(crate) fn capture_well_formed_diff_slices<T>(
+    algorithm: Algorithm,
+    old: &[T],
+    new: &[T],
+) -> Vec<DiffOp>
+where
+    T: Eq + Hash + Ord,
+{
+    let compact = capture_diff_slices(algorithm, old, new);
+    if diff_operations_are_well_formed(&compact, old.len(), new.len()) {
+        return compact;
+    }
+
+    let mut capture = Replace::new(Capture::new());
+    diff_slices(algorithm, &mut capture, old, new).expect("capturing a slice diff is infallible");
+    let operations = capture.into_inner().into_ops();
+    if diff_operations_are_well_formed(&operations, old.len(), new.len()) {
+        operations
+    } else {
+        vec![DiffOp::Replace {
+            old_index: 0,
+            old_len: old.len(),
+            new_index: 0,
+            new_len: new.len(),
+        }]
+    }
+}
+
+fn diff_operations_are_well_formed(operations: &[DiffOp], old_len: usize, new_len: usize) -> bool {
+    let mut old_end = 0;
+    let mut new_end = 0;
+    let contiguous = operations.iter().all(|operation| {
+        let old_range = operation.old_range();
+        let new_range = operation.new_range();
+        let contiguous = old_range.start == old_end && new_range.start == new_end;
+        old_end = old_range.end;
+        new_end = new_range.end;
+        contiguous
+    });
+    contiguous && old_end == old_len && new_end == new_len
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "snake_case")]
@@ -914,7 +962,7 @@ fn structural_review_changes(
         .map(|block| chunk_group_text(after, std::slice::from_ref(block)))
         .collect::<Vec<_>>();
     let mut planned = Vec::new();
-    for operation in capture_diff_slices(Algorithm::Patience, &old_text, &new_text) {
+    for operation in capture_well_formed_diff_slices(Algorithm::Patience, &old_text, &new_text) {
         if operation.tag() == DiffTag::Equal {
             continue;
         }
@@ -1906,6 +1954,27 @@ mod tests {
             source_content: content.to_owned(),
             tracked_delete_ranges: vec![],
             raw: json!([]),
+        }
+    }
+
+    #[test]
+    fn compacted_diff_operations_fall_back_to_complete_monotonic_ranges() {
+        let old = "aab".chars().collect::<Vec<_>>();
+        let new = "bbb".chars().collect::<Vec<_>>();
+        let compact = capture_diff_slices(Algorithm::Myers, &old, &new);
+        assert!(!diff_operations_are_well_formed(
+            &compact,
+            old.len(),
+            new.len()
+        ));
+
+        for algorithm in [Algorithm::Myers, Algorithm::Patience, Algorithm::Lcs] {
+            let operations = capture_well_formed_diff_slices(algorithm, &old, &new);
+            assert!(diff_operations_are_well_formed(
+                &operations,
+                old.len(),
+                new.len()
+            ));
         }
     }
 

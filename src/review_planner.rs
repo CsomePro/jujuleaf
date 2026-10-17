@@ -2,13 +2,13 @@ use std::cmp::Ordering;
 use std::ops::Range;
 
 use anyhow::{Result, ensure};
-use similar::{Algorithm, DiffTag, capture_diff_slices};
+use similar::{Algorithm, DiffTag};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::latex_blocks::{LatexBlockKind, scan_latex_blocks};
 use crate::operations::{
-    InputChange, PlannedTextChange, ReviewAnchor, ReviewGranularity, minimal_text_changes,
-    slice_utf16, utf16_len,
+    InputChange, PlannedTextChange, ReviewAnchor, ReviewGranularity,
+    capture_well_formed_diff_slices, minimal_text_changes, slice_utf16, utf16_len,
 };
 
 const HUNK_OVERHEAD: usize = 32;
@@ -355,9 +355,11 @@ fn grapheme_review_atoms(before: &str, after: &str) -> Vec<PlannedTextChange> {
     let new = after.graphemes(true).collect::<Vec<_>>();
     let old_offsets = utf16_offsets(&old);
     let new_offsets = utf16_offsets(&new);
+    let operations = capture_well_formed_diff_slices(Algorithm::Myers, &old, &new);
+
     let mut atoms = Vec::new();
 
-    for operation in capture_diff_slices(Algorithm::Myers, &old, &new) {
+    for operation in operations {
         if operation.tag() == DiffTag::Equal {
             continue;
         }
@@ -641,6 +643,51 @@ mod tests {
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].change.expect.as_deref(), Some("e\u{301}"));
         assert_eq!(planned[0].change.insert.as_deref(), Some("e\u{300}"));
+    }
+
+    #[test]
+    fn compacted_crossing_edits_fall_back_to_monotonic_operations() {
+        for granularity in [
+            ReviewGranularity::Exact,
+            ReviewGranularity::Word,
+            ReviewGranularity::Sentence,
+            ReviewGranularity::Adaptive,
+        ] {
+            let planned = plan("aab", "bbb", granularity, &[]);
+            assert!(
+                planned
+                    .windows(2)
+                    .all(|pair| change_end(&pair[0].change) <= pair[1].change.from)
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_and_unicode_graphemes_always_produce_applicable_plans() {
+        let samples = [
+            "",
+            "a",
+            "aa",
+            "aab",
+            "bbb",
+            "ababa",
+            "🙂a🙂",
+            "🙂🙂b",
+            "e\u{301}e\u{301}",
+            "e\u{300}e\u{301}",
+        ];
+        for before in samples {
+            for after in samples {
+                for granularity in [
+                    ReviewGranularity::Exact,
+                    ReviewGranularity::Word,
+                    ReviewGranularity::Sentence,
+                    ReviewGranularity::Adaptive,
+                ] {
+                    plan(before, after, granularity, &[]);
+                }
+            }
+        }
     }
 
     #[test]
