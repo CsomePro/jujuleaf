@@ -212,7 +212,7 @@ impl PlannerFacts {
                 let hard = contains_hard_latex_boundary(
                     atom.change.expect.as_deref().unwrap_or_default(),
                     level,
-                ) || contains_hard_latex_boundary(
+                ) || contains_inserted_block_boundary(
                     atom.change.insert.as_deref().unwrap_or_default(),
                     level,
                 );
@@ -289,8 +289,11 @@ pub(crate) fn hierarchical_review_changes(
     before: &str,
     after: &str,
     granularity: ReviewGranularity,
-    anchors: &[ReviewAnchor],
+    _anchors: &[ReviewAnchor],
 ) -> Result<Vec<PlannedTextChange>> {
+    // Overleaf rebases comments to a replacement boundary. Sentence, line,
+    // and existing LaTeX boundaries keep that movement local without turning
+    // every edit inside a comment into a separate tracked change.
     let atoms = grapheme_review_atoms(before, after);
     if granularity == ReviewGranularity::Exact || atoms.len() < 2 {
         return Ok(atoms);
@@ -318,7 +321,7 @@ pub(crate) fn hierarchical_review_changes(
         let limit = atoms.len().min(start + MAX_MERGED_ATOMS);
         for end in start + 2..=limit {
             let Some(metrics) =
-                candidate_metrics(&atoms, start, end, &facts, &hierarchy, granularity, anchors)
+                candidate_metrics(&atoms, start, end, &facts, &hierarchy, granularity)
             else {
                 continue;
             };
@@ -439,11 +442,10 @@ fn candidate_metrics(
     facts: &PlannerFacts,
     hierarchy: &TextHierarchy,
     granularity: ReviewGranularity,
-    anchors: &[ReviewAnchor],
 ) -> Option<CandidateMetrics> {
     let from = atoms[start].change.from;
     let to = change_end(&atoms[end - 1].change);
-    if hierarchy.crosses_latex_boundary(from, to) || intersects_anchor(from, to, anchors) {
+    if hierarchy.crosses_latex_boundary(from, to) {
         return None;
     }
 
@@ -485,13 +487,10 @@ fn contains_hard_latex_boundary(text: &str, level: ReviewLevel) -> bool {
     })
 }
 
-fn intersects_anchor(from: usize, to: usize, anchors: &[ReviewAnchor]) -> bool {
-    anchors.iter().any(|anchor| {
-        if anchor.from == anchor.to {
-            from < anchor.from && anchor.from < to
-        } else {
-            from < anchor.to && anchor.from < to
-        }
+fn contains_inserted_block_boundary(text: &str, level: ReviewLevel) -> bool {
+    text.chars().any(|character| {
+        matches!(character, '$' | '%' | '#' | '^' | '\n' | '\r')
+            || (level != ReviewLevel::Line && character == '&')
     })
 }
 
@@ -691,11 +690,11 @@ mod tests {
     }
 
     #[test]
-    fn comment_anchor_splits_an_otherwise_dense_line() {
-        let before = "alpha old middle old omega";
-        let after = "alpha new middle new omega";
-        let anchor_from = utf16_len("alpha old ");
-        let anchor_to = anchor_from + utf16_len("middle");
+    fn comment_anchor_does_not_fragment_a_dense_sentence_rewrite() {
+        let before = "Context. A fixed interval is selected before evaluation. Tail.";
+        let after = "Context. When the interval is unknown, the controller searches several public candidates and retains the unique consistent candidate. Tail.";
+        let anchor_from = utf16_len("Context. ");
+        let anchor_to = anchor_from + utf16_len("A fixed interval is selected before evaluation.");
         let planned = plan(
             before,
             after,
@@ -705,14 +704,51 @@ mod tests {
                 to: anchor_to,
             }],
         );
+        assert_eq!(planned.len(), 1);
+        let removed = planned[0].change.expect.as_deref().unwrap();
+        assert!(!removed.contains("Context."));
+        assert!(!removed.contains("Tail."));
+    }
+
+    #[test]
+    fn comment_anchor_with_latex_reference_stays_readable() {
+        let before = "Context. In a search over multiple public intervals, uniqueness is defined relative to the prespecified search domain. Tail.";
+        let after = "Context. When the reachable interval is unknown, the controller searches a prespecified collection of candidate intervals and accepts a candidate only when it is unique across that searched collection (Section~\\ref{sec:consistency}). Tail.";
+        let anchor_from = utf16_len("Context. ");
+        let anchor_to = anchor_from
+            + utf16_len(
+                "In a search over multiple public intervals, uniqueness is defined relative to the prespecified search domain.",
+            );
+        let planned = plan(
+            before,
+            after,
+            ReviewGranularity::Adaptive,
+            &[ReviewAnchor {
+                from: anchor_from,
+                to: anchor_to,
+            }],
+        );
+        assert_eq!(
+            planned.len(),
+            1,
+            "unexpectedly fragmented plan: {planned:#?}"
+        );
+        assert!(planned.iter().all(|item| {
+            let removed = item.change.expect.as_deref().unwrap_or_default();
+            !removed.contains("Context.") && !removed.contains("Tail.")
+        }));
+    }
+
+    #[test]
+    fn existing_latex_command_remains_a_merge_boundary() {
+        let before = "See Section~\\ref{sec:old} for the old result.";
+        let after = "Consult Section~\\ref{sec:old} for the revised result.";
+        let planned = plan(before, after, ReviewGranularity::Adaptive, &[]);
         assert_eq!(planned.len(), 2);
         assert!(planned.iter().all(|item| {
-            !item
-                .change
-                .expect
-                .as_deref()
-                .unwrap_or_default()
-                .contains("middle")
+            let removed = item.change.expect.as_deref().unwrap_or_default();
+            let inserted = item.change.insert.as_deref().unwrap_or_default();
+            !removed.contains("\\ref") && !inserted.contains("\\ref")
         }));
     }
 }
